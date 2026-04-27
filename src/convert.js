@@ -4,6 +4,55 @@ import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
 import { isPrivateHost } from './netfilter.js';
 
+// Permissive but explicit tag allowlist for email HTML.
+// Excludes by omission: script, iframe, object, embed, frame, frameset, applet,
+// form/input/button/textarea/select/option/label/fieldset/legend, base, link, noscript.
+const EMAIL_ALLOWED_TAGS = [
+  // Document / sectioning
+  'html', 'head', 'body', 'title', 'style', 'meta',
+  'header', 'footer', 'main', 'section', 'article', 'aside', 'nav',
+  'div', 'span', 'p', 'br', 'hr', 'wbr',
+  // Headings
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  // Inline / typography
+  'a', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'ins', 'mark',
+  'small', 'big', 'sub', 'sup', 'font', 'center',
+  'abbr', 'acronym', 'cite', 'q', 'kbd', 'samp', 'var', 'code', 'pre',
+  'time', 'data', 'bdi', 'bdo', 'ruby', 'rt', 'rp',
+  // Lists
+  'ul', 'ol', 'li', 'dl', 'dt', 'dd', 'menu',
+  // Blocks
+  'blockquote', 'address', 'figure', 'figcaption', 'details', 'summary',
+  // Tables (heavy use in email)
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th',
+  'caption', 'colgroup', 'col',
+  // Media
+  'img', 'picture', 'source', 'map', 'area',
+];
+
+const EMAIL_ALLOWED_ATTRS = [
+  // Generic
+  'id', 'class', 'style', 'title', 'lang', 'dir', 'role', 'tabindex',
+  // ARIA — non-executable, ok to keep
+  'aria-label', 'aria-hidden', 'aria-describedby', 'aria-labelledby',
+  // Anchor / image
+  'href', 'target', 'rel', 'name', 'src', 'alt', 'srcset', 'sizes',
+  'usemap', 'ismap', 'shape', 'coords',
+  'loading', 'decoding', 'referrerpolicy', 'crossorigin',
+  // Sizing / legacy presentational (Outlook/Word/marketing emails rely on these)
+  'width', 'height', 'align', 'valign', 'border', 'bgcolor', 'color',
+  'cellpadding', 'cellspacing', 'colspan', 'rowspan', 'span',
+  'face', 'size', 'nowrap', 'hspace', 'vspace',
+  // Tables
+  'summary', 'scope', 'headers', 'abbr',
+  // Meta (limited — meta refresh is rewritten in transformTags)
+  'charset', 'http-equiv', 'content',
+  // <style> / <link>
+  'type', 'media',
+  // <time>
+  'datetime',
+];
+
 let _browserPromise = null;
 
 function getBrowser() {
@@ -125,31 +174,24 @@ function buildHtml(mail, timezone = 'UTC') {
   // Strip MS Word page rules (best-effort, single-level brace match)
   rawHtml = rawHtml.replace(/@page\s+\w*\s*\{[^}]*\}/gi, '');
 
-  // Sanitize: keep layout/typography/styling tags & attrs, drop active content.
-  // We allow a permissive set so rendering fidelity stays high.
+  // Sanitize: explicit allowlist of tags & attributes used in real-world email HTML.
+  // Permissive enough to keep Outlook/Word/marketing renderings faithful, but no
+  // active content (script/iframe/object/form/...) and no navigation hijacks.
   const cleanBody = sanitizeHtml(rawHtml, {
-    allowedTags: false, // allow all tags by default
-    allowedAttributes: false, // allow all attributes by default
+    allowedTags: EMAIL_ALLOWED_TAGS,
+    allowedAttributes: { '*': EMAIL_ALLOWED_ATTRS },
     disallowedTagsMode: 'discard',
-    nonBooleanAttributes: ['*'],
-    // Explicit kill list — active content & navigation hijacks
-    exclusiveFilter: (frame) => {
-      const t = frame.tag?.toLowerCase();
-      return t === 'script' || t === 'iframe' || t === 'object' || t === 'embed'
-          || t === 'frame' || t === 'frameset' || t === 'applet'
-          || t === 'form' || t === 'button' || t === 'input' || t === 'textarea' || t === 'select'
-          || t === 'base';
-    },
+    selfClosing: ['img', 'br', 'hr', 'col', 'wbr', 'source', 'area'],
     transformTags: {
-      // Strip on* event handlers and javascript: URLs from anywhere
+      // Strip on* handlers and dangerous URL schemes from any tag.
       '*': (tagName, attribs) => {
         const cleaned = {};
         for (const [k, v] of Object.entries(attribs)) {
           if (k.toLowerCase().startsWith('on')) continue;
-          if (typeof v === 'string') {
-            const trimmed = v.trim().toLowerCase();
-            if ((k === 'href' || k === 'src' || k === 'action' || k === 'formaction')
-                && (trimmed.startsWith('javascript:') || trimmed.startsWith('vbscript:') || trimmed.startsWith('data:text/html'))) {
+          if (typeof v === 'string'
+              && (k === 'href' || k === 'src' || k === 'action' || k === 'formaction' || k === 'background')) {
+            const t = v.trim().toLowerCase();
+            if (t.startsWith('javascript:') || t.startsWith('vbscript:') || t.startsWith('data:text/html')) {
               continue;
             }
           }
@@ -157,8 +199,8 @@ function buildHtml(mail, timezone = 'UTC') {
         }
         return { tagName, attribs: cleaned };
       },
-      // Strip http-equiv refresh
-      'meta': (tagName, attribs) => {
+      // Drop <meta http-equiv="refresh"> — turn into an inert span.
+      meta: (tagName, attribs) => {
         if (attribs['http-equiv']?.toLowerCase() === 'refresh') return { tagName: 'span', attribs: {} };
         return { tagName, attribs };
       },
@@ -167,8 +209,16 @@ function buildHtml(mail, timezone = 'UTC') {
     allowedSchemesByTag: {
       img: ['http', 'https', 'data', 'cid'],
     },
-    allowVulnerableTags: false,
     parseStyleAttributes: false, // keep style attrs as-is for fidelity
+    // We intentionally keep <style> and <meta> in the allowlist — both are
+    // essential for email rendering fidelity (Outlook/marketing emails rely
+    // heavily on <style>). Defenses in depth that make this safe here:
+    //   - JS is disabled in the rendering BrowserContext (no script execution)
+    //   - CSP injected in <head> blocks scripts/frames/objects/forms
+    //   - context.route blocks private/internal hosts and dangerous schemes
+    //     (so @import / url() can only fetch public resources, same as <img>)
+    //   - <meta http-equiv="refresh"> is rewritten to an inert <span> above
+    allowVulnerableTags: true,
   });
 
   const ccLine = mail.cc?.text ? `<div><strong>CC:</strong> ${esc(mail.cc.text)}</div>` : '';
