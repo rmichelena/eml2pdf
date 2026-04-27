@@ -108,11 +108,11 @@ export async function convertEmail(emlBuf, opts = {}) {
 
   const mail = await simpleParser(emlBuf);
 
-  const { html, inlineCount } = buildHtml(mail, timezone);
+  const { html, inlineCount, usedCids } = buildHtml(mail, timezone, warnings);
 
   const pdfBuffer = await renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout, warnings });
 
-  const attachments = extractAttachments(mail);
+  const attachments = extractAttachments(mail, usedCids);
 
   const metadata = {
     messageId: messageId || mail.messageId || undefined,
@@ -140,43 +140,46 @@ export async function convertEmail(emlBuf, opts = {}) {
   return { zipBuffer, metadata };
 }
 
-function buildHtml(mail, timezone = 'UTC') {
+function normalizeCid(value = '') {
+  let cid = String(value)
+    .trim()
+    .replace(/^cid:/i, '')
+    .replace(/&lt;|&gt;/gi, '')   // HTML-encoded angle brackets
+    .replace(/[<>]/g, '');
+  try { cid = decodeURIComponent(cid); } catch { /* keep as-is */ }
+  return cid;
+}
+
+export { buildHtml as buildHtmlForTest };
+
+function buildHtml(mail, timezone = 'UTC', warnings = []) {
   const attachments = mail.attachments || [];
 
-  // Map cid → data URL for inline images
+  // Build a cid → data URL map for all image attachments with a Content-ID,
+  // and a parallel cid → dataUrl record we'll use later to detect which
+  // images actually ended up inline in the rendered HTML.
+  // Casing is inconsistent across clients, so index both canonical and lowercase.
   const cidMap = new Map();
+  const dataUrlByCid = new Map();
   for (const att of attachments) {
     if (att.contentId && att.contentType?.startsWith('image/')) {
-      const cleanCid = att.contentId.replace(/[<>]/g, '');
-      cidMap.set(cleanCid, bufferToDataUrl(att.content, att.contentType));
+      const cid = normalizeCid(att.contentId);
+      const dataUrl = bufferToDataUrl(att.content, att.contentType);
+      cidMap.set(cid, dataUrl);
+      cidMap.set(cid.toLowerCase(), dataUrl);
+      dataUrlByCid.set(cid, dataUrl);
     }
   }
 
   let rawHtml = mail.html || mail.textAsHtml || escapeHtml(mail.text || '');
 
-  // Replace cid: references with data URLs (and track which were actually used)
-  const usedCids = new Set();
-  let inlineCount = 0;
-  rawHtml = rawHtml.replace(/src=(["'])cid:([^"']+)\1/gi, (m, q, cid) => {
-    const cleanCid = cid.replace(/[<>]/g, '');
-    const dataUrl = cidMap.get(cleanCid);
-    if (dataUrl) {
-      usedCids.add(cleanCid);
-      inlineCount++;
-      return `src=${q}${dataUrl}${q}`;
-    }
-    return m;
-  });
-
-  // Mark used inline cids back on the mail object so extractAttachments can skip them
-  mail.__usedInlineCids = usedCids;
-
   // Strip MS Word page rules (best-effort, single-level brace match)
   rawHtml = rawHtml.replace(/@page\s+\w*\s*\{[^}]*\}/gi, '');
 
-  // Sanitize: explicit allowlist of tags & attributes used in real-world email HTML.
-  // Permissive enough to keep Outlook/Word/marketing renderings faithful, but no
-  // active content (script/iframe/object/form/...) and no navigation hijacks.
+  // Sanitize FIRST — before we splice giant data: URLs into the markup. This
+  // also lets the parser normalize attribute formatting (entity-encoded chars,
+  // weird quoting) so the regex below sees uniform `src="cid:..."` strings.
+  // Note: 'cid' is in allowedSchemes, so cid: URLs survive sanitization intact.
   const cleanBody = sanitizeHtml(rawHtml, {
     allowedTags: EMAIL_ALLOWED_TAGS,
     allowedAttributes: { '*': EMAIL_ALLOWED_ATTRS },
@@ -221,6 +224,47 @@ function buildHtml(mail, timezone = 'UTC') {
     allowVulnerableTags: true,
   });
 
+  // Resolve any cid: → data: that mailparser didn't already inline.
+  // mailparser auto-resolves `<img src="cid:...">` for multipart/related
+  // emails, but only the canonical quoted form — unquoted attributes and
+  // case-mismatched CIDs slip through. The tolerant regex below covers the
+  // gap. Chromium can't load cid: itself in setContent and our context.route
+  // would block it anyway, so anything that doesn't get replaced here would
+  // fail to render. (And was the cause of signatures showing up as files
+  // instead of inline in the PDF before this fix.)
+  let bodyWithImages = cleanBody.replace(
+    /\bsrc\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
+    (m, q, rawCid) => {
+      const cid = normalizeCid(rawCid);
+      const dataUrl = cidMap.get(cid) || cidMap.get(cid.toLowerCase());
+      if (!dataUrl) return m;
+      const quote = q || '"';
+      return `src=${quote}${dataUrl}${quote}`;
+    }
+  );
+
+  // Determine which image attachments actually made it inline by checking the
+  // final HTML for their data: URL. This is robust regardless of which path
+  // performed the substitution (mailparser pre-render, our regex above, or
+  // even an exotic third route). Comparing the full data URL is fine
+  // performance-wise: one substring scan per image attachment per request.
+  const usedCids = new Set();
+  for (const [cid, dataUrl] of dataUrlByCid) {
+    if (bodyWithImages.includes(dataUrl)) {
+      usedCids.add(cid);
+      usedCids.add(cid.toLowerCase());
+    }
+  }
+  const inlineCount = usedCids.size > 0
+    ? new Set([...usedCids].map(c => c.toLowerCase())).size
+    : 0;
+
+  // If any cid: src survived, the corresponding image will be missing from
+  // the PDF — surface that explicitly so it shows up in metadata.json.
+  if (/\bsrc\s*=\s*["']?\s*cid:/i.test(bodyWithImages)) {
+    warnings.push('Some inline CID images could not be resolved');
+  }
+
   const ccLine = mail.cc?.text ? `<div><strong>CC:</strong> ${esc(mail.cc.text)}</div>` : '';
   const headerHtml = `
     <div style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #ccc;font-family:Arial,sans-serif;font-size:11pt;line-height:1.5">
@@ -253,8 +297,9 @@ function buildHtml(mail, timezone = 'UTC') {
       html,body{margin:0;padding:0;width:100%}
       body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.4}
       img{max-width:100%;height:auto}
-    </style></head><body>${headerHtml}${cleanBody}</body></html>`,
+    </style></head><body>${headerHtml}${bodyWithImages}</body></html>`,
     inlineCount,
+    usedCids,
   };
 }
 
@@ -358,16 +403,20 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout
   }
 }
 
-function extractAttachments(mail) {
-  const usedInlineCids = mail.__usedInlineCids || new Set();
+function extractAttachments(mail, usedCids = new Set()) {
   const attachments = [];
   const seenNames = new Map(); // base name → count
 
   for (const att of mail.attachments || []) {
     if (!att.filename && !att.contentType) continue;
 
-    const cleanCid = att.contentId?.replace(/[<>]/g, '') || null;
-    const isInline = cleanCid && usedInlineCids.has(cleanCid);
+    // usedCids is the authoritative signal: it lists the CIDs whose data: URL
+    // ended up in the rendered HTML (whether inlined by mailparser or by our
+    // own regex). att.related alone is NOT enough — mailparser sets it for
+    // every multipart/related part, including ones whose cid: it couldn't
+    // actually substitute, and including ones not referenced anywhere.
+    const cid = att.contentId ? normalizeCid(att.contentId) : null;
+    const isInline = cid && (usedCids.has(cid) || usedCids.has(cid.toLowerCase()));
     if (isInline) continue;
 
     let name = sanitizeFilename(att.filename || `attachment-${attachments.length}`);

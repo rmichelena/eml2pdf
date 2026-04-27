@@ -137,8 +137,16 @@ Versión actual usa lifecycle de Playwright (CDP, lado Node — no necesita JS e
 
 Pequeña pérdida de fidelidad teórica vs `fonts.ready`: ±1 paint cycle en emails con web fonts agresivas. Aceptable para mantener `javaScriptEnabled: false`, que es la última capa anti-XSS independiente de sanitize-html y de la CSP.
 
-### 🟡 2.9 CIDs no referenciados se perdían como adjunto ✅
-`buildHtml` ahora marca como “inline usado” *sólo* las imágenes con `cid:` realmente referenciadas en el HTML. Las que tienen `Content-ID` pero nadie las cita, salen como adjunto normal en `attachments/`.
+### 🟡 2.9 CIDs no referenciados se perdían como adjunto ✅ (revisado tras regresión)
+Versión inicial del PR: marcaba como inline sólo las imágenes que un regex `cid:`→`data:` reemplazaba con éxito. Lo correcto en intención, pero **regresionó las firmas inline en PDF**: mailparser ya hace su propia substitución `cid:`→`data:` en `mail.html` para casos canónicos `<img src="cid:...">`, así que cuando llegaba al regex el cid ya no estaba ahí, `usedCids` quedaba vacía, y la firma — pese a estar embebida en el HTML — se *duplicaba* como `attachments/signature.jpg`. Y peor: en algunos casos (CID con casing distinto, src sin comillas) mailparser ni inlinaba ni nuestro regex acertaba → la firma no aparecía en el PDF *ni* como adjunto, simplemente desaparecía.
+
+Versión actual:
+- **Detección por data-URL en HTML final** (no por hit de regex). Después de sanitizar y de aplicar nuestro regex de fallback, recorremos los attachments con `Content-ID` y comprobamos si su `data:` URL aparece en el body. Esa señal es autoritativa, independientemente de quién hiciera el reemplazo (mailparser o nuestro regex).
+- **Regex de cid: tolerante**: acepta comillas dobles, simples, sin comillas, espacios alrededor del `=`, y casing distinto entre HTML y `Content-ID`.
+- **Orden corregido**: sanitize-html corre **antes** de splicear data: URLs (potencialmente enormes) en el markup. Beneficio adicional: el parser HTML normaliza atributos antes de que llegue el regex.
+- **`normalizeCid`** unifica trim, strip de `<>` literales y entidades `&lt;&gt;`, y `decodeURIComponent` defensivo.
+- **Warning explícito** si algún `cid:` queda sin resolver: aparece en `metadata.json` para diagnóstico.
+- **Tests** en [`test/cid.js`](test/cid.js) cubren los 6 formatos de `<img src=...>` que aparecen en correo real, dos CIDs referenciados, CID huérfano (debe salir como adjunto), y referencia rota (debe disparar warning).
 
 ### 🟡 2.10 Colisión de filename del PDF
 Aceptable: cada ZIP es independiente. Si downstream descomprime varios al mismo destino, será problema del orquestador.
