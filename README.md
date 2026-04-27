@@ -105,6 +105,27 @@ process memory footprint stays predictable.
 503 is meant to be exceptional. Tune `MAX_CONCURRENT_RENDERS` and
 `MAX_QUEUED_EML_MB` so the steady state is "always queue, rarely reject".
 
+### Measured behavior
+
+100 concurrent conversions of ~2 MB synthetic emails against the default
+config (`MAX_CONCURRENT_RENDERS=5`, `MAX_QUEUED_EML_MB=500`):
+
+| Metric | Value |
+|---|---|
+| Wall time | ~15 s |
+| CPU peak | ~200 % (2 cores) |
+| RAM peak | ~553 MB |
+| 503 responses | 0 |
+
+Reproduce with [`test/load.js`](test/load.js):
+
+```bash
+docker compose up -d --build
+BASE_URL=http://127.0.0.1:3005 N=100 SIZE_MB=2 node test/load.js
+# in another terminal:
+docker stats eml2pdf
+```
+
 ## metadata.json
 
 ```json
