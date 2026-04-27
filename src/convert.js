@@ -41,6 +41,7 @@ const EMAIL_ALLOWED_ATTRS = [
   'loading', 'decoding', 'referrerpolicy', 'crossorigin',
   // Sizing / legacy presentational (Outlook/Word/marketing emails rely on these)
   'width', 'height', 'align', 'valign', 'border', 'bgcolor', 'color',
+  'background',  // <body|table|td background="..."> — used by hero images
   'cellpadding', 'cellspacing', 'colspan', 'rowspan', 'span',
   'face', 'size', 'nowrap', 'hspace', 'vspace',
   // Tables
@@ -226,20 +227,56 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
 
   // Resolve any cid: → data: that mailparser didn't already inline.
   // mailparser auto-resolves `<img src="cid:...">` for multipart/related
-  // emails, but only the canonical quoted form — unquoted attributes and
-  // case-mismatched CIDs slip through. The tolerant regex below covers the
-  // gap. Chromium can't load cid: itself in setContent and our context.route
-  // would block it anyway, so anything that doesn't get replaced here would
-  // fail to render. (And was the cause of signatures showing up as files
-  // instead of inline in the PDF before this fix.)
-  let bodyWithImages = cleanBody.replace(
+  // emails, but only the canonical quoted form — unquoted attributes,
+  // case-mismatched CIDs, `background=cid:...` (legacy Outlook/marketing),
+  // and CSS `url(cid:...)` slip through. Chromium can't load cid: itself
+  // in setContent and our context.route would block it anyway, so anything
+  // not replaced here would fail to render.
+  const unresolvedCids = new Set();
+
+  function resolveCid(rawCid) {
+    const cid = normalizeCid(rawCid);
+    const dataUrl = cidMap.get(cid) || cidMap.get(cid.toLowerCase());
+    if (!dataUrl) {
+      unresolvedCids.add(cid);
+      return null;
+    }
+    return dataUrl;
+  }
+
+  let bodyWithImages = cleanBody;
+
+  // Pass 1: <img src="cid:..."> and <source src="cid:...">
+  bodyWithImages = bodyWithImages.replace(
     /\bsrc\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
     (m, q, rawCid) => {
-      const cid = normalizeCid(rawCid);
-      const dataUrl = cidMap.get(cid) || cidMap.get(cid.toLowerCase());
+      const dataUrl = resolveCid(rawCid);
       if (!dataUrl) return m;
       const quote = q || '"';
       return `src=${quote}${dataUrl}${quote}`;
+    }
+  );
+
+  // Pass 2: <body background="cid:...">, <table background="cid:...">,
+  //         <td background="cid:..."> — legacy Outlook/marketing pattern.
+  bodyWithImages = bodyWithImages.replace(
+    /\bbackground\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
+    (m, q, rawCid) => {
+      const dataUrl = resolveCid(rawCid);
+      if (!dataUrl) return m;
+      const quote = q || '"';
+      return `background=${quote}${dataUrl}${quote}`;
+    }
+  );
+
+  // Pass 3: CSS url(cid:...) inside style="..." attributes or <style> blocks.
+  bodyWithImages = bodyWithImages.replace(
+    /url\s*\(\s*(["']?)\s*cid:([^"'\s)]+)\1\s*\)/gi,
+    (m, q, rawCid) => {
+      const dataUrl = resolveCid(rawCid);
+      if (!dataUrl) return m;
+      const quote = q || '"';
+      return `url(${quote}${dataUrl}${quote})`;
     }
   );
 
@@ -259,10 +296,16 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     ? new Set([...usedCids].map(c => c.toLowerCase())).size
     : 0;
 
-  // If any cid: src survived, the corresponding image will be missing from
-  // the PDF — surface that explicitly so it shows up in metadata.json.
-  if (/\bsrc\s*=\s*["']?\s*cid:/i.test(bodyWithImages)) {
-    warnings.push('Some inline CID images could not be resolved');
+  // Surface unresolved CIDs individually so metadata.json is diagnostic.
+  // Cap the listing to keep the array bounded if a malformed email references
+  // dozens of broken cids.
+  const MAX_UNRESOLVED_LISTED = 10;
+  const unresolvedList = [...unresolvedCids];
+  for (const cid of unresolvedList.slice(0, MAX_UNRESOLVED_LISTED)) {
+    warnings.push(`Unresolved CID image: ${cid}`);
+  }
+  if (unresolvedList.length > MAX_UNRESOLVED_LISTED) {
+    warnings.push(`…and ${unresolvedList.length - MAX_UNRESOLVED_LISTED} more unresolved CID(s)`);
   }
 
   const ccLine = mail.cc?.text ? `<div><strong>CC:</strong> ${esc(mail.cc.text)}</div>` : '';
@@ -311,29 +354,31 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout
   });
 
   // Network filter: always block dangerous schemes & private IPs.
-  // When loadRemoteImages=false, additionally block all http(s).
+  // When loadRemoteImages=false, additionally block all http(s) and emit a
+  // single aggregated warning at the end with the unique blocked hosts (so a
+  // tracking-pixel-heavy email doesn't flood the warnings array).
+  const blockedRemoteHosts = new Set();
+
   await context.route('**/*', async (route) => {
     const req = route.request();
     const url = req.url();
 
-    // Allow data: and inline cid: (cid is rewritten before render, but defensive)
     if (url.startsWith('data:') || url.startsWith('about:') || url.startsWith('blob:')) {
       return route.continue();
     }
 
-    // The very first navigation to setContent is about:blank, already handled above.
-    // Anything else must be http(s).
     if (!/^https?:\/\//i.test(url)) {
-      return route.abort('blockedbyclient');
-    }
-
-    if (!loadRemoteImages) {
       return route.abort('blockedbyclient');
     }
 
     let host;
     try { host = new URL(url).hostname; }
     catch { return route.abort('blockedbyclient'); }
+
+    if (!loadRemoteImages) {
+      blockedRemoteHosts.add(host);
+      return route.abort('blockedbyclient');
+    }
 
     try {
       if (await isPrivateHost(host)) {
@@ -396,6 +441,19 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout
       height: `${pdfHeight}px`,
       margin: { top: '0', right: '0', bottom: '0', left: '0' },
     });
+
+    // Aggregated remote-blocked notice (only when LOAD_REMOTE_IMAGES disabled).
+    // Per-host, capped to keep metadata small.
+    if (!loadRemoteImages && blockedRemoteHosts.size > 0) {
+      const hosts = [...blockedRemoteHosts];
+      const MAX_LISTED = 10;
+      warnings.push(
+        `Blocked ${hosts.length} remote resource host(s) (LOAD_REMOTE_IMAGES disabled): ` +
+        hosts.slice(0, MAX_LISTED).join(', ') +
+        (hosts.length > MAX_LISTED ? `, …+${hosts.length - MAX_LISTED}` : '')
+      );
+    }
+
     return Buffer.from(pdf);
   } finally {
     await page.close().catch(() => {});

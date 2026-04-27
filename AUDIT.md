@@ -146,7 +146,13 @@ Versión actual:
 - **Orden corregido**: sanitize-html corre **antes** de splicear data: URLs (potencialmente enormes) en el markup. Beneficio adicional: el parser HTML normaliza atributos antes de que llegue el regex.
 - **`normalizeCid`** unifica trim, strip de `<>` literales y entidades `&lt;&gt;`, y `decodeURIComponent` defensivo.
 - **Warning explícito** si algún `cid:` queda sin resolver: aparece en `metadata.json` para diagnóstico.
-- **Tests** en [`test/cid.js`](test/cid.js) cubren los 6 formatos de `<img src=...>` que aparecen en correo real, dos CIDs referenciados, CID huérfano (debe salir como adjunto), y referencia rota (debe disparar warning).
+- **Tres pasadas de reemplazo** ahora cubren las formas reales:
+  - `<img src=cid:...>` (con/sin comillas, espacios alrededor del `=`)
+  - `<table|td|body background=cid:...>` (legacy Outlook hero images)
+  - `style="background-image:url(cid:...)"` y `<style>...url(cid:...)...</style>` (CSS)
+- **`background` añadido a `EMAIL_ALLOWED_ATTRS`** — sin esto sanitize-html lo descartaba antes incluso de llegar al regex.
+- **Warnings granulares** en `metadata.json`: `Unresolved CID image: <cid>` por cada CID irresoluble (capado a 10), y un agregado `Blocked N remote resource host(s)` cuando `LOAD_REMOTE_IMAGES=false` cortó algo (con lista de hasta 10 hosts).
+- **Tests** en [`test/cid.js`](test/cid.js): 6 variantes de `src=`, 2 CIDs referenciados, huérfano, referencia rota, `background="cid:"`, `url(cid:)`, `url('cid:')`. Todos pasan.
 
 ### 🟡 2.10 Colisión de filename del PDF
 Aceptable: cada ZIP es independiente. Si downstream descomprime varios al mismo destino, será problema del orquestador.

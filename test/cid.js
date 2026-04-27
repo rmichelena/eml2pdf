@@ -126,15 +126,51 @@ ${SIG_B64}
     { inlineCount, usedCids: [...usedCids], warnings });
 }
 
-// HTML references a CID that doesn't exist in attachments → warning + 0 inline.
+// HTML references a CID that doesn't exist in attachments → per-cid warning + 0 inline.
 {
   const mail = await simpleParser(makeEml('<img src="cid:does-not-exist@example.com">'));
   const warnings = [];
   const { html, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
   const cidStillThere = /cid:does-not-exist/.test(html);
-  check('unresolved cid: produces a warning',
-    inlineCount === 0 && warnings.some(w => /CID/i.test(w)) && cidStillThere,
+  const perCidWarning = warnings.some(w => /Unresolved CID image: does-not-exist@example\.com/.test(w));
+  check('unresolved cid: produces a per-cid warning',
+    inlineCount === 0 && perCidWarning && cidStillThere,
     { inlineCount, warnings, cidStillThere });
+}
+
+// background="cid:..." (legacy Outlook/marketing hero pattern).
+{
+  const mail = await simpleParser(makeEml('<table background="cid:sig123@example.com"><tr><td>x</td></tr></table>'));
+  const warnings = [];
+  const { html, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const cidGone = !/background\s*=\s*["']?cid:/i.test(html);
+  check('background="cid:..." resolved',
+    hasDataUrl && cidGone && inlineCount === 1 && usedCids.has('sig123@example.com') && warnings.length === 0,
+    { inlineCount, usedCids: [...usedCids], warnings });
+}
+
+// CSS url(cid:...) inside style attribute.
+{
+  const mail = await simpleParser(makeEml('<div style="background-image:url(cid:sig123@example.com)">x</div>'));
+  const warnings = [];
+  const { html, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const cidGone = !/url\([^)]*cid:/i.test(html);
+  check('CSS url(cid:...) resolved',
+    hasDataUrl && cidGone && inlineCount === 1 && usedCids.has('sig123@example.com') && warnings.length === 0,
+    { inlineCount, usedCids: [...usedCids], warnings, snippet: html.slice(html.indexOf('<body'), html.indexOf('<body')+300) });
+}
+
+// CSS url('cid:...') with single quotes inside style.
+{
+  const mail = await simpleParser(makeEml(`<div style="background:url('cid:sig123@example.com')">x</div>`));
+  const warnings = [];
+  const { html, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  check(`CSS url('cid:...') with single quotes resolved`,
+    hasDataUrl && inlineCount === 1 && warnings.length === 0,
+    { inlineCount, warnings });
 }
 
 if (fail) {
