@@ -173,8 +173,119 @@ ${SIG_B64}
     { inlineCount, warnings });
 }
 
+// =====================================================================
+// Pagination CSS regression tests. Outlook/Word and many marketing emails
+// ship page-break-* / break-* / @page declarations that, in a single-long-
+// page PDF, force unwanted page breaks (typically right before the body,
+// after our injected header). The strip should remove every variant.
+// =====================================================================
+
+function makePlainHtmlEml(html) {
+  return Buffer.from(
+`From: a@example.com
+Subject: pagination
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+${html}
+`,
+    'utf8'
+  );
+}
+
+const PAGINATION_FIXTURES = [
+  {
+    name: 'Word section pagination in <style> block',
+    html: `<html><head><style>
+      div.WordSection1 { page: WordSection1; }
+      p.first { page-break-before: always; }
+      .lead { break-before: page; }
+      @page WordSection1 { size: 8.5in 11in; margin: 1in }
+    </style></head><body>
+      <div class="WordSection1"><p class="first">Hello</p></div>
+    </body></html>`,
+  },
+  {
+    name: 'Outlook mso-page-break-before',
+    html: `<style>div.section { mso-page-break-before: always; }</style>
+           <div class="section">x</div>`,
+  },
+  {
+    name: 'inline style="page-break-before:always"',
+    html: `<p style="color:red; page-break-before: always; font-size:14px">x</p>`,
+  },
+  {
+    name: 'inline style="break-before:page" with !important',
+    html: `<p style="break-before: page !important; color: red">x</p>`,
+  },
+  {
+    name: '@page rule alone (no name, with margin)',
+    html: `<style>@page { size: auto; margin: 1in }</style><p>x</p>`,
+  },
+];
+
+for (const fx of PAGINATION_FIXTURES) {
+  const mail = await simpleParser(makePlainHtmlEml(fx.html));
+  const { html } = buildHtmlForTest(mail, 'UTC', []);
+
+  // Slice to the body so we don't false-positive on our own injected <style>.
+  const bodyStart = html.indexOf('<body');
+  const body = html.slice(bodyStart);
+
+  const noPageBreak = !/\bpage-break-(?:before|after|inside)\s*:/i.test(body);
+  const noBreak = !/\bbreak-(?:before|after|inside)\s*:/i.test(body);
+  const noPage = !/\bpage\s*:\s*\w/i.test(body);
+  const noAtPage = !/@page\b/i.test(body);
+  const noMso = !/\bmso-page-break/i.test(body);
+  // The user's content survives — we strip pagination, not text content.
+  const contentSurvives = /Hello|x/.test(body);
+
+  check(`pagination strip — ${fx.name}`,
+    noPageBreak && noBreak && noPage && noAtPage && noMso && contentSurvives,
+    { noPageBreak, noBreak, noPage, noAtPage, noMso, contentSurvives,
+      bodySnippet: body.slice(0, 600) });
+}
+
+// Inline style with mixed declarations: pagination removed, the rest kept.
+{
+  const mail = await simpleParser(makePlainHtmlEml(
+    `<p style="color:red; page-break-before:always; font-size:14px; break-after: page">hi</p>`
+  ));
+  const { html } = buildHtmlForTest(mail, 'UTC', []);
+  const body = html.slice(html.indexOf('<body'));
+  const colorKept = /color\s*:\s*red/.test(body);
+  const fontSizeKept = /font-size\s*:\s*14px/.test(body);
+  const pbGone = !/page-break-before/.test(body);
+  const baGone = !/break-after/.test(body);
+  check('inline style: kill pagination, keep rest',
+    colorKept && fontSizeKept && pbGone && baGone,
+    { colorKept, fontSizeKept, pbGone, baGone, body: body.slice(0, 400) });
+}
+
+// Document scaffolding: <html>/<head>/<body>/<title>/<meta> from the email
+// must NOT survive verbatim inside our outer <body>. <style> from inside
+// <head> must survive.
+{
+  const mail = await simpleParser(makePlainHtmlEml(
+    `<html><head><title>SPAM</title><meta http-equiv="refresh" content="0;url=https://evil"><style>.foo{color:red}</style></head><body><p>content</p></body></html>`
+  ));
+  const { html } = buildHtmlForTest(mail, 'UTC', []);
+  const body = html.slice(html.indexOf('<body'));
+  // Email's <title> text must not leak into rendered body.
+  const noTitleLeak = !/SPAM/.test(body);
+  // Email's <meta refresh> dropped.
+  const noMeta = !/<meta[^>]*refresh/i.test(body);
+  // Email's <style> survived.
+  const styleKept = /\.foo\s*\{\s*color\s*:\s*red\s*\}/.test(body);
+  // Content kept.
+  const contentKept = /content/.test(body);
+  check('document scaffolding unwrapped, <style> kept',
+    noTitleLeak && noMeta && styleKept && contentKept,
+    { noTitleLeak, noMeta, styleKept, contentKept, body: body.slice(0, 600) });
+}
+
 if (fail) {
   console.error(`\n${fail} test(s) failed`);
   process.exit(1);
 }
-console.log('\nAll CID tests passed');
+console.log('\nAll tests passed');

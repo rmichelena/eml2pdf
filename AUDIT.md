@@ -146,6 +146,10 @@ Versión actual:
 - **Orden corregido**: sanitize-html corre **antes** de splicear data: URLs (potencialmente enormes) en el markup. Beneficio adicional: el parser HTML normaliza atributos antes de que llegue el regex.
 - **`normalizeCid`** unifica trim, strip de `<>` literales y entidades `&lt;&gt;`, y `decodeURIComponent` defensivo.
 - **Warning explícito** si algún `cid:` queda sin resolver: aparece en `metadata.json` para diagnóstico.
+- **CSS de paginación neutralizada en origen**: helper `stripPaginationCss` que elimina `@page` rules, declaraciones `page-break-{before,after,inside}`, `break-{before,after,inside}`, `page: NAME`, y variantes Word/Outlook `mso-page-break-{before,after}`. Aplicado a (a) cada `style="…"` vía `transformTags` y (b) cada bloque `<style>…</style>` post-sanitize. Esto fixea el page-break espurio entre header y body en correos Outlook/Word — un override CSS con `!important` no era suficiente porque selectores específicos del email (`.MsoNormal` etc.) ganaban en cascada.
+- **Document scaffolding del email unwrapped**: `<html>`, `<head>`, `<body>`, `<title>`, `<meta>` ya no están en `EMAIL_ALLOWED_TAGS`. `<html>`/`<head>`/`<body>` se transforman a `<div>` para preservar children (especialmente `<style>` dentro de `<head>`). `<title>` añadido a `nonTextTags` para que el texto del título no se filtre al body. `<meta http-equiv="refresh">` ahora se descarta automáticamente (ya no necesita transform especial, `<meta>` está fuera del allowlist).
+- **Body envuelto en `<div id="eml2pdf-email-body">`** con override defensivo limitado al wrapper y a su primer hijo — defense-in-depth si el strip dejara algo pasar.
+
 - **Tres pasadas de reemplazo** ahora cubren las formas reales:
   - `<img src=cid:...>` (con/sin comillas, espacios alrededor del `=`)
   - `<table|td|body background=cid:...>` (legacy Outlook hero images)

@@ -7,9 +7,13 @@ import { isPrivateHost } from './netfilter.js';
 // Permissive but explicit tag allowlist for email HTML.
 // Excludes by omission: script, iframe, object, embed, frame, frameset, applet,
 // form/input/button/textarea/select/option/label/fieldset/legend, base, link, noscript.
+// Also excluded: html, head, body, title, meta. These are document-level tags
+// that don't belong inside our outer <body>; we transform <html>/<head>/<body>
+// to <div> in transformTags so their *children* survive (especially <style>),
+// while the duplicate document scaffolding is dropped.
 const EMAIL_ALLOWED_TAGS = [
-  // Document / sectioning
-  'html', 'head', 'body', 'title', 'style', 'meta',
+  // Sectioning & flow
+  'style',
   'header', 'footer', 'main', 'section', 'article', 'aside', 'nav',
   'div', 'span', 'p', 'br', 'hr', 'wbr',
   // Headings
@@ -141,6 +145,26 @@ export async function convertEmail(emlBuf, opts = {}) {
   return { zipBuffer, metadata };
 }
 
+// Pagination CSS in email content forces unwanted page breaks in our
+// "single long-page PDF" rendering model. We can't rely on a CSS override
+// (`* { page-break-*: auto !important }`) because email rules with higher
+// selector specificity (e.g. `.MsoNormal { page-break-before: always !important }`)
+// win the cascade. Strip the rules at source instead — applied to <style>
+// blocks and to inline style attributes alike.
+function stripPaginationCss(css = '') {
+  return String(css)
+    // @page rules (any prefix, like `@page WordSection1 { ... }`)
+    .replace(/@page\b[^{]*\{[^{}]*\}/gi, '')
+    // page-break-* / break-* / page declarations (with or without trailing ;)
+    .replace(
+      /\b(?:page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page)\s*:\s*[^;{}]+;?/gi,
+      ''
+    )
+    // mso-* prefixed Word/Outlook variants
+    .replace(/\bmso-page-break-before\s*:\s*[^;{}]+;?/gi, '')
+    .replace(/\bmso-page-break-after\s*:\s*[^;{}]+;?/gi, '');
+}
+
 function normalizeCid(value = '') {
   let cid = String(value)
     .trim()
@@ -174,9 +198,6 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
 
   let rawHtml = mail.html || mail.textAsHtml || escapeHtml(mail.text || '');
 
-  // Strip MS Word page rules (best-effort, single-level brace match)
-  rawHtml = rawHtml.replace(/@page\s+\w*\s*\{[^}]*\}/gi, '');
-
   // Sanitize FIRST — before we splice giant data: URLs into the markup. This
   // also lets the parser normalize attribute formatting (entity-encoded chars,
   // weird quoting) so the regex below sees uniform `src="cid:..."` strings.
@@ -186,8 +207,14 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     allowedAttributes: { '*': EMAIL_ALLOWED_ATTRS },
     disallowedTagsMode: 'discard',
     selfClosing: ['img', 'br', 'hr', 'col', 'wbr', 'source', 'area'],
+    // Tags whose entire text content is dropped alongside the tag, regardless
+    // of allowedTags. Default covers script/style/textarea/option/noscript;
+    // we add 'title' so the email's `<head><title>SPAM</title></head>` doesn't
+    // leak its text into our rendered body when the head is unwrapped.
+    nonTextTags: ['script', 'style', 'textarea', 'option', 'noscript', 'title'],
     transformTags: {
-      // Strip on* handlers and dangerous URL schemes from any tag.
+      // Strip on* handlers, dangerous URL schemes, and pagination CSS from
+      // inline style="..." attributes on any tag.
       '*': (tagName, attribs) => {
         const cleaned = {};
         for (const [k, v] of Object.entries(attribs)) {
@@ -199,31 +226,46 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
               continue;
             }
           }
+          if (k.toLowerCase() === 'style' && typeof v === 'string') {
+            cleaned[k] = stripPaginationCss(v);
+            continue;
+          }
           cleaned[k] = v;
         }
         return { tagName, attribs: cleaned };
       },
-      // Drop <meta http-equiv="refresh"> — turn into an inert span.
-      meta: (tagName, attribs) => {
-        if (attribs['http-equiv']?.toLowerCase() === 'refresh') return { tagName: 'span', attribs: {} };
-        return { tagName, attribs };
-      },
+      // Email's nested document scaffolding: unwrap <html>/<head>/<body>
+      // to <div> so their children survive (notably <style> inside <head>),
+      // while we keep our own outer document structure.
+      html: (tagName, attribs) => ({ tagName: 'div', attribs }),
+      head: (tagName, attribs) => ({ tagName: 'div', attribs }),
+      body: (tagName, attribs) => ({ tagName: 'div', attribs }),
     },
     allowedSchemes: ['http', 'https', 'mailto', 'tel', 'cid', 'data'],
     allowedSchemesByTag: {
       img: ['http', 'https', 'data', 'cid'],
     },
     parseStyleAttributes: false, // keep style attrs as-is for fidelity
-    // We intentionally keep <style> and <meta> in the allowlist — both are
-    // essential for email rendering fidelity (Outlook/marketing emails rely
-    // heavily on <style>). Defenses in depth that make this safe here:
+    // We intentionally keep <style> in the allowlist — it's essential for
+    // email rendering fidelity (Outlook/marketing emails rely heavily on it).
+    // Defenses in depth that make this safe here:
     //   - JS is disabled in the rendering BrowserContext (no script execution)
     //   - CSP injected in <head> blocks scripts/frames/objects/forms
     //   - context.route blocks private/internal hosts and dangerous schemes
     //     (so @import / url() can only fetch public resources, same as <img>)
-    //   - <meta http-equiv="refresh"> is rewritten to an inert <span> above
+    //   - <meta http-equiv="refresh"> can't slip through: <meta> is no longer
+    //     in the allowlist at all, so sanitize-html discards it entirely
     allowVulnerableTags: true,
   });
+
+  // Strip pagination CSS from <style> blocks (the per-attribute strip is
+  // already handled in transformTags '*'). Combined with the @page removal
+  // inside stripPaginationCss, this neutralizes Outlook/Word section
+  // pagination rules that would otherwise force unwanted page breaks.
+  const cleanBodyNoPagination = cleanBody.replace(
+    /(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi,
+    (_, open, css, close) => `${open}${stripPaginationCss(css)}${close}`
+  );
 
   // Resolve any cid: → data: that mailparser didn't already inline.
   // mailparser auto-resolves `<img src="cid:...">` for multipart/related
@@ -244,7 +286,7 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     return dataUrl;
   }
 
-  let bodyWithImages = cleanBody;
+  let bodyWithImages = cleanBodyNoPagination;
 
   // Pass 1: <img src="cid:..."> and <source src="cid:...">
   bodyWithImages = bodyWithImages.replace(
@@ -341,22 +383,17 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
       html,body{margin:0;padding:0;width:100%}
       body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.4}
       img{max-width:100%;height:auto}
-      /* The PDF is rendered as a single long page (height = scrollHeight).
-         Outlook/Word emails frequently carry page-break-before/after rules
-         (or their mso- prefixed variants) on section divs, which cause an
-         unwanted break right before the body in the rendered PDF. Override
-         all print pagination so the single-page contract holds regardless
-         of what CSS the email ships with. These properties are print-only
-         and don't affect on-screen layout / fidelity. */
-      *,*::before,*::after{
+      /* Defensive belt-and-suspenders: even after we strip page-break and
+         break declarations from the email's <style> blocks and inline style
+         attributes, force the boundary between our header and the email
+         content not to break. The real fix is the source-strip in
+         stripPaginationCss; this just guards against a missed corner case. */
+      #eml2pdf-email-body,
+      #eml2pdf-email-body > :first-child{
         page-break-before:auto !important;
-        page-break-after:auto !important;
-        page-break-inside:auto !important;
         break-before:auto !important;
-        break-after:auto !important;
-        break-inside:auto !important;
       }
-    </style></head><body>${headerHtml}${bodyWithImages}</body></html>`,
+    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${bodyWithImages}</div></body></html>`,
     inlineCount,
     usedCids,
   };
