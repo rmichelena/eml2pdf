@@ -337,9 +337,25 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     html: `<!DOCTYPE html><html><head><meta charset="utf-8">
       <meta http-equiv="Content-Security-Policy" content="${csp}">
       <style>
+      @page { size: auto; margin: 0 }
       html,body{margin:0;padding:0;width:100%}
       body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.4}
       img{max-width:100%;height:auto}
+      /* The PDF is rendered as a single long page (height = scrollHeight).
+         Outlook/Word emails frequently carry page-break-before/after rules
+         (or their mso- prefixed variants) on section divs, which cause an
+         unwanted break right before the body in the rendered PDF. Override
+         all print pagination so the single-page contract holds regardless
+         of what CSS the email ships with. These properties are print-only
+         and don't affect on-screen layout / fidelity. */
+      *,*::before,*::after{
+        page-break-before:auto !important;
+        page-break-after:auto !important;
+        page-break-inside:auto !important;
+        break-before:auto !important;
+        break-after:auto !important;
+        break-inside:auto !important;
+      }
     </style></head><body>${headerHtml}${bodyWithImages}</body></html>`,
     inlineCount,
     usedCids,
