@@ -95,8 +95,16 @@ Validación con regex y rechazo explícito (`400 Invalid base64 payload`) para `
 ### 🔴 2.1 Race en `getBrowser()` → fugas de Chromium ✅
 Ahora un **promise singleton** en `convert.js`. La primera llamada lanza, las concurrentes esperan a la misma promesa. Si falla, `_browserPromise` se nulea. Si el browser se desconecta, también.
 
-### 🔴 2.2 Sin límite de concurrencia ✅
-Semáforo simple en `server.js` con `MAX_CONCURRENT_RENDERS` (default 3). Las peticiones por encima del cupo esperan en cola FIFO. Cuando la cola sea problema (no hoy), devolver 503 con `Retry-After`.
+### 🔴 2.2 Sin límite de concurrencia + cola sin acotar ✅
+Semáforo `MAX_CONCURRENT_RENDERS` (default 5) **+ backlog acotado por bytes** (`MAX_QUEUED_EML_MB`, default 500 MB) **+ deadline de espera** (`MAX_QUEUE_WAIT_MS`, default 180 s).
+
+- Si el request entra en cupo, render directo.
+- Si no, espera FIFO mientras la suma de `emlBuf.length` en cola no supere el límite.
+- Si lo supera, 503 inmediato con `Retry-After: 10` y headers `X-Queue-Limit-MB`, `X-Queued-Bytes`, `X-In-Flight-Renders`.
+- Si el deadline expira, 503 con la misma forma.
+- 503 está pensado para ser excepcional — la cola absorbe ráfagas para que n8n no necesite reintentos agresivos.
+
+Script de carga manual en [`test/load.js`](test/load.js) (100 requests concurrentes de 2 MB por defecto).
 
 ### 🟠 2.3 `parseMultipart`: reject/resolve duplicados ✅
 Flag `settled` + helpers `safeReject`/`safeResolve`. `req.unpipe(bb)` y `req.destroy()` en reject. Listener de `stream 'limit'` y `req 'aborted'`. Límites adicionales: `files: 1`, `fields: 20`, `fieldSize: 1MB`.

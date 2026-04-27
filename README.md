@@ -83,6 +83,27 @@ result.zip
 | `LOAD_REMOTE_IMAGES` | `false` | Allow loading remote images by default |
 | `DEFAULT_TIMEZONE` | `UTC` | Default timezone for dates |
 | `CONVERSION_TIMEOUT_MS` | `60000` | Default per-conversion timeout |
+| `MAX_CONCURRENT_RENDERS` | `5` | Max simultaneous Chromium renders |
+| `MAX_QUEUED_EML_MB` | `500` | Total bytes of queued (waiting) emails before returning 503 |
+| `MAX_QUEUE_WAIT_MS` | `180000` | Max time a queued request waits for a render slot before 503 |
+| `API_KEY` | _(empty)_ | If set, require this value in `X-API-Key` header |
+
+## Backpressure
+
+Renders run with a configurable concurrency limit. Excess requests wait in a
+FIFO queue bounded by **bytes of queued payload** (not just count) so the
+process memory footprint stays predictable.
+
+- If the new request fits within `MAX_QUEUED_EML_MB`, it waits up to
+  `MAX_QUEUE_WAIT_MS` for a slot. Good fit for n8n's HTTP Request retry semantics.
+- If the queue is full, or if the wait deadline passes, the server returns
+  **503** with `Retry-After: 10` and observability headers:
+  - `X-Queue-Limit-MB`
+  - `X-Queued-Bytes`
+  - `X-In-Flight-Renders`
+
+503 is meant to be exceptional. Tune `MAX_CONCURRENT_RENDERS` and
+`MAX_QUEUED_EML_MB` so the steady state is "always queue, rarely reject".
 
 ## metadata.json
 

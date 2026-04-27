@@ -11,7 +11,10 @@ const DEFAULT_MAX_HEIGHT_PX = parseInt(process.env.DEFAULT_MAX_HEIGHT_PX || '300
 const LOAD_REMOTE_IMAGES = process.env.LOAD_REMOTE_IMAGES === 'true';
 const CONVERSION_TIMEOUT_MS = parseInt(process.env.CONVERSION_TIMEOUT_MS || '60000', 10);
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'UTC';
-const MAX_CONCURRENT_RENDERS = parseInt(process.env.MAX_CONCURRENT_RENDERS || '3', 10);
+const MAX_CONCURRENT_RENDERS = parseInt(process.env.MAX_CONCURRENT_RENDERS || '5', 10);
+const MAX_QUEUED_EML_MB = parseInt(process.env.MAX_QUEUED_EML_MB || '500', 10);
+const MAX_QUEUED_EML_BYTES = MAX_QUEUED_EML_MB * 1024 * 1024;
+const MAX_QUEUE_WAIT_MS = parseInt(process.env.MAX_QUEUE_WAIT_MS || '180000', 10);
 const API_KEY = process.env.API_KEY || '';
 
 // Bounds for client-supplied options (DoS protection)
@@ -24,20 +27,62 @@ const clamp = (v, lo, hi, def) => {
   return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : def;
 };
 
-// Simple in-process semaphore
+// Render-slot semaphore with byte-bounded backlog.
+// We hold the eml buffer in memory while queued, so bound the total queued bytes,
+// not just the slot count. Requests that fit in the queue wait (good for n8n);
+// requests that don't get an immediate 503 + Retry-After.
 let inFlight = 0;
+let queuedBytes = 0;
 const queue = [];
-function acquire() {
+
+function acquire(bytes) {
   if (inFlight < MAX_CONCURRENT_RENDERS) {
     inFlight++;
     return Promise.resolve();
   }
-  return new Promise((r) => queue.push(r));
+
+  if (queuedBytes + bytes > MAX_QUEUED_EML_BYTES) {
+    return Promise.reject(Object.assign(new Error('Conversion queue full'), {
+      status: 503,
+      retryAfter: 10,
+    }));
+  }
+
+  queuedBytes += bytes;
+
+  return new Promise((resolve, reject) => {
+    const item = { bytes, resolve, reject, timer: null };
+
+    item.timer = setTimeout(() => {
+      const idx = queue.indexOf(item);
+      if (idx !== -1) {
+        queue.splice(idx, 1);
+        queuedBytes -= bytes;
+      }
+      reject(Object.assign(new Error('Conversion queue timeout'), {
+        status: 503,
+        retryAfter: 10,
+      }));
+    }, MAX_QUEUE_WAIT_MS);
+
+    queue.push(item);
+  });
 }
+
 function release() {
-  inFlight--;
+  inFlight = Math.max(0, inFlight - 1);
+
   const next = queue.shift();
-  if (next) { inFlight++; next(); }
+  if (next) {
+    clearTimeout(next.timer);
+    queuedBytes -= next.bytes;
+    inFlight++;
+    next.resolve();
+  }
+}
+
+export function _queueStateForTests() {
+  return { inFlight, queuedBytes, queueLength: queue.length };
 }
 
 function checkAuth(req) {
@@ -116,7 +161,7 @@ async function handleConvert(req, res, requestId) {
       timezone: typeof options?.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
     };
 
-    await acquire();
+    await acquire(emlBuf.length);
     acquired = true;
 
     const result = await convertEmail(emlBuf, { messageId, ...opts });
@@ -137,14 +182,27 @@ async function handleConvert(req, res, requestId) {
     }));
   } catch (err) {
     const status = err.status || 500;
-    const clientMsg = status >= 500 ? 'Internal error' : err.message;
+    // Backpressure errors (queue full / queue timeout) keep their original message —
+    // it's useful for the client to know why it got 503.
+    const isBackpressure = status === 503 && err.retryAfter;
+    const clientMsg = (status >= 500 && !isBackpressure) ? 'Internal error' : err.message;
     console.error(JSON.stringify({
       level: 'error', requestId,
       durationMs: Date.now() - started,
       status,
       error: err.message,
+      queuedBytes,
+      inFlight,
     }));
-    if (!res.headersSent) jsonError(res, status, clientMsg);
+    if (!res.headersSent) {
+      if (err.retryAfter) {
+        res.setHeader('Retry-After', String(err.retryAfter));
+        res.setHeader('X-Queue-Limit-MB', String(MAX_QUEUED_EML_MB));
+        res.setHeader('X-Queued-Bytes', String(queuedBytes));
+        res.setHeader('X-In-Flight-Renders', String(inFlight));
+      }
+      jsonError(res, status, clientMsg);
+    }
   } finally {
     if (acquired) release();
   }
@@ -197,7 +255,7 @@ function jsonError(res, status, message) {
 }
 
 server.listen(PORT, () => {
-  console.log(`mail-to-pdf listening on :${PORT} (max ${MAX_REQUEST_MB}MB, concurrency ${MAX_CONCURRENT_RENDERS}, auth ${API_KEY ? 'on' : 'off'})`);
+  console.log(`mail-to-pdf listening on :${PORT} (max ${MAX_REQUEST_MB}MB/req, concurrency ${MAX_CONCURRENT_RENDERS}, queue ${MAX_QUEUED_EML_MB}MB/${MAX_QUEUE_WAIT_MS}ms, auth ${API_KEY ? 'on' : 'off'})`);
 });
 
 let shuttingDown = false;

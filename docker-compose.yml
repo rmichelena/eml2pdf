@@ -14,7 +14,9 @@ services:
       - DEFAULT_MAX_HEIGHT_PX=30000
       - LOAD_REMOTE_IMAGES=false
       - DEFAULT_TIMEZONE=UTC
-      - MAX_CONCURRENT_RENDERS=3
+      - MAX_CONCURRENT_RENDERS=5
+      - MAX_QUEUED_EML_MB=500
+      - MAX_QUEUE_WAIT_MS=180000
       # - API_KEY=change-me   # uncomment to require X-API-Key header
     shm_size: "1gb"
     security_opt:
