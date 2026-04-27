@@ -1,0 +1,16 @@
+services:
+  eml2pdf:
+    build: .
+    container_name: eml2pdf
+    restart: unless-stopped
+    ports:
+      - "3005:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - MAX_REQUEST_MB=50
+      - DEFAULT_WIDTH_PX=900
+      - DEFAULT_MAX_HEIGHT_PX=30000
+      - LOAD_REMOTE_IMAGES=false
+      - DEFAULT_TIMEZONE=UTC
+    shm_size: "1gb"

@@ -1,0 +1,20 @@
+{
+  "name": "eml2pdf",
+  "version": "1.0.0",
+  "description": "Dockerized microservice to convert Gmail raw or EML emails to PDF + metadata + attachments ZIP",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "busboy": "^1.6.0",
+    "mailparser": "^3.7.2",
+    "playwright": "^1.52.0"
+  }
+}
