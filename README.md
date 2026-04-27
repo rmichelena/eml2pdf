@@ -68,7 +68,7 @@ result.zip
 |---|---|---|
 | `widthPx` | `900` | PDF width in pixels |
 | `maxHeightPx` | `30000` | Max PDF height; taller emails get truncated + warning |
-| `loadRemoteImages` | `false` | Allow loading external images over the network |
+| `loadRemoteImages` | `LOAD_REMOTE_IMAGES` env | Allow loading external images. The env var is a **ceiling**: a request can opt out (`false`), but cannot opt in if the operator disabled it via env. |
 | `timezone` | `UTC` | IANA timezone for date display in PDF header and filenames |
 | `timeout` | `60000` | Per-conversion timeout in ms |
 
@@ -80,7 +80,7 @@ result.zip
 | `MAX_REQUEST_MB` | `50` | Max request body size in MB |
 | `DEFAULT_WIDTH_PX` | `900` | Default PDF width |
 | `DEFAULT_MAX_HEIGHT_PX` | `30000` | Default max PDF height |
-| `LOAD_REMOTE_IMAGES` | `false` | Allow loading remote images by default |
+| `LOAD_REMOTE_IMAGES` | `true` (in compose) / `false` (Dockerfile baseline) | Operator ceiling for remote image loading. When `true`, public-internet images load; private/loopback/IMDS hosts are still blocked at the network filter. When `false`, no http(s) request leaves the renderer. |
 | `DEFAULT_TIMEZONE` | `UTC` | Default timezone for dates |
 | `CONVERSION_TIMEOUT_MS` | `60000` | Default per-conversion timeout |
 | `MAX_CONCURRENT_RENDERS` | `5` | Max simultaneous Chromium renders |

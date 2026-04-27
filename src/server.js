@@ -149,14 +149,20 @@ async function handleConvert(req, res, requestId) {
       messageId = messageId.replace(/[\x00-\x1f]/g, '').slice(0, 998);
     }
 
-    // Env acts as a ceiling: client cannot ELEVATE remote-image loading above operator setting.
+    // Env acts as a ceiling: client cannot ELEVATE remote-image loading above
+    // the operator setting. Track WHY remote was disabled so the warning we
+    // emit later is actionable (env vs client choice).
     const clientWantsRemote = options?.loadRemoteImages !== false;
     const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
+    const remoteDisabledReason = loadRemoteImages
+      ? null
+      : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
 
     const opts = {
       widthPx: clamp(options?.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
       maxHeightPx: clamp(options?.maxHeightPx, HEIGHT_MIN, HEIGHT_MAX, DEFAULT_MAX_HEIGHT_PX),
       loadRemoteImages,
+      remoteDisabledReason,
       timeout: clamp(options?.timeout, TIMEOUT_MIN, TIMEOUT_MAX, CONVERSION_TIMEOUT_MS),
       timezone: typeof options?.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
     };

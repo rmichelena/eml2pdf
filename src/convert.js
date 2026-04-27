@@ -105,6 +105,7 @@ export async function convertEmail(emlBuf, opts = {}) {
     widthPx = 900,
     maxHeightPx = 30000,
     loadRemoteImages = false,
+    remoteDisabledReason = null,
     timeout = 60000,
     timezone = 'UTC',
   } = opts;
@@ -115,7 +116,9 @@ export async function convertEmail(emlBuf, opts = {}) {
 
   const { html, inlineCount, usedCids } = buildHtml(mail, timezone, warnings);
 
-  const pdfBuffer = await renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout, warnings });
+  const pdfBuffer = await renderPdf(html, {
+    widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings,
+  });
 
   const attachments = extractAttachments(mail, usedCids);
 
@@ -399,7 +402,7 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
   };
 }
 
-async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout, warnings }) {
+async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings }) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     javaScriptEnabled: false, // emails don't need JS — kills a whole class of risk
@@ -495,13 +498,20 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout
       margin: { top: '0', right: '0', bottom: '0', left: '0' },
     });
 
-    // Aggregated remote-blocked notice (only when LOAD_REMOTE_IMAGES disabled).
-    // Per-host, capped to keep metadata small.
+    // Aggregated remote-blocked notice (only when remote loading disabled).
+    // Per-host, capped to keep metadata small. Attribution makes the warning
+    // actionable: 'env' = operator capped via LOAD_REMOTE_IMAGES, 'client' =
+    // request body passed loadRemoteImages:false.
     if (!loadRemoteImages && blockedRemoteHosts.size > 0) {
       const hosts = [...blockedRemoteHosts];
       const MAX_LISTED = 10;
+      const cause = remoteDisabledReason === 'env'
+        ? 'remote loading disabled by server config (env LOAD_REMOTE_IMAGES=false; set it to true to enable)'
+        : remoteDisabledReason === 'client'
+        ? 'request opted out via options.loadRemoteImages:false'
+        : 'remote loading disabled';
       warnings.push(
-        `Blocked ${hosts.length} remote resource host(s) (LOAD_REMOTE_IMAGES disabled): ` +
+        `Blocked ${hosts.length} remote resource host(s) — ${cause}: ` +
         hosts.slice(0, MAX_LISTED).join(', ') +
         (hosts.length > MAX_LISTED ? `, …+${hosts.length - MAX_LISTED}` : '')
       );

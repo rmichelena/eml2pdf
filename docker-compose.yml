@@ -12,7 +12,11 @@ services:
       - MAX_REQUEST_MB=50
       - DEFAULT_WIDTH_PX=900
       - DEFAULT_MAX_HEIGHT_PX=30000
-      - LOAD_REMOTE_IMAGES=false
+      # Remote images on by default for fidelity with marketing/signature emails.
+      # Private/loopback/IMDS hosts are still blocked at the network filter, so
+      # SSRF is contained even when this is true. Set to false if you need a
+      # stricter posture (no public-internet fetches at all from the renderer).
+      - LOAD_REMOTE_IMAGES=true
       - DEFAULT_TIMEZONE=UTC
       - MAX_CONCURRENT_RENDERS=5
       - MAX_QUEUED_EML_MB=500
