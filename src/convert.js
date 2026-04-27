@@ -307,19 +307,37 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, timeout
   page.setDefaultNavigationTimeout(timeout);
 
   try {
-    // With remote loading, we need networkidle so images/fonts settle before measuring height.
-    // Without it, 'load' is enough (no remote requests will fire anyway thanks to the route).
+    // IMPORTANT: javaScriptEnabled is false on this context (security layer).
+    // That means we MUST NOT await any page.evaluate(...) that returns a Promise
+    // whose resolution depends on main-world script execution — e.g.
+    // requestAnimationFrame callbacks or any setTimeout-based wait IN the page.
+    // Those would deadlock: the callback never fires, the promise never resolves,
+    // page.evaluate doesn't honor setDefaultTimeout. Use Playwright's CDP-driven
+    // lifecycle waits instead (waitForLoadState, waitForTimeout — both run on
+    // the Node side, not in the page).
+    //
+    // Synchronous evaluates (returning a primitive, like scrollHeight) are fine:
+    // they execute in an isolated world via CDP Runtime.evaluate, independent
+    // of the page's main-world JS being disabled.
     await page.setContent(html, {
-      waitUntil: loadRemoteImages ? 'networkidle' : 'load',
+      waitUntil: loadRemoteImages ? 'domcontentloaded' : 'commit',
       timeout,
     });
 
-    // Wait for web fonts (matters for fidelity & accurate height measurement)
-    await page.evaluate(() => (document.fonts && document.fonts.ready) ? document.fonts.ready : null)
-      .catch(() => {});
-    // Two RAFs for layout flush
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))))
-      .catch(() => {});
+    if (loadRemoteImages) {
+      // Wait for subresources (images, web fonts, external CSS) to settle.
+      // Capped so a single slow remote font can't stall a render.
+      await page.waitForLoadState('networkidle', {
+        timeout: Math.min(timeout, 10_000),
+      }).catch(() => warnings.push(
+        'Timed out waiting for remote resources; rendering with partial resources'
+      ));
+    }
+
+    // Small breathing room for the layout/paint cycle after resources settled
+    // (or after commit, when remote is off). Larger when remote is on to absorb
+    // any post-font reflow.
+    await page.waitForTimeout(loadRemoteImages ? 150 : 50);
 
     const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
     const pdfHeight = Math.min(scrollHeight, maxHeightPx);

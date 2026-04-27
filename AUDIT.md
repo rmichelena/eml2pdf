@@ -125,8 +125,17 @@ Handlers `SIGTERM`/`SIGINT`: `server.close()`, espera a in-flight (deadline 30s)
 ### 🟡 2.7 ZIP enteramente en memoria
 Pendiente. `archiver` se sigue acumulando en `chunks[]`. Para escalar, hacer `zip.pipe(res)` y `res.writeHead(...)` antes. Bajo riesgo con `MAX_REQUEST_MB=50` y concurrencia 3.
 
-### 🟡 2.8 Medición de altura con remoto ✅
-Con remoto: `waitUntil: 'networkidle'` + `document.fonts.ready` + 2× `requestAnimationFrame` antes de leer `scrollHeight`. Fuentes web no fastidian la medida.
+### 🟡 2.8 Medición de altura con remoto ✅ (revisado)
+Versión inicial usaba `document.fonts.ready` + 2× `requestAnimationFrame` vía `page.evaluate`. **Esto colgaba**: `javaScriptEnabled: false` mata el main world del page, así que las callbacks de rAF nunca se dispatchaban → la Promise nunca resolvía → `page.evaluate` no respeta `setDefaultTimeout` → render bloqueado indefinidamente, slot del semáforo retenido, cola backed up hasta el `MAX_QUEUE_WAIT_MS`.
+
+Versión actual usa lifecycle de Playwright (CDP, lado Node — no necesita JS en el page):
+
+- `waitUntil: 'domcontentloaded'` cuando hay remoto, `'commit'` cuando no.
+- Cuando hay remoto, `page.waitForLoadState('networkidle')` con cap de 10 s para que un host lento no estanque el render. Si vence, se añade warning en `metadata.json` y se sigue.
+- `page.waitForTimeout(150)` con remoto / `50` sin remoto, para absorber el paint cycle posterior.
+- `page.evaluate` síncrono (sin Promise) sigue siendo seguro y mide `scrollHeight` igual.
+
+Pequeña pérdida de fidelidad teórica vs `fonts.ready`: ±1 paint cycle en emails con web fonts agresivas. Aceptable para mantener `javaScriptEnabled: false`, que es la última capa anti-XSS independiente de sanitize-html y de la CSP.
 
 ### 🟡 2.9 CIDs no referenciados se perdían como adjunto ✅
 `buildHtml` ahora marca como “inline usado” *sólo* las imágenes con `cid:` realmente referenciadas en el HTML. Las que tienen `Content-ID` pero nadie las cita, salen como adjunto normal en `attachments/`.
