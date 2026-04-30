@@ -158,6 +158,19 @@ async function handleConvert(req, res, requestId) {
       ? null
       : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
 
+    // outputs: array of formats to produce. Default ['pdf'] for backward
+    // compatibility. convertEmail validates the values.
+    let requestedOutputs;
+    if (options?.outputs !== undefined) {
+      if (!Array.isArray(options.outputs)) {
+        return jsonError(res, 400, 'options.outputs must be an array of strings ("pdf", "markdown")');
+      }
+      if (options.outputs.length === 0) {
+        return jsonError(res, 400, 'options.outputs cannot be empty');
+      }
+      requestedOutputs = options.outputs;
+    }
+
     const opts = {
       widthPx: clamp(options?.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
       maxHeightPx: clamp(options?.maxHeightPx, HEIGHT_MIN, HEIGHT_MAX, DEFAULT_MAX_HEIGHT_PX),
@@ -165,6 +178,7 @@ async function handleConvert(req, res, requestId) {
       remoteDisabledReason,
       timeout: clamp(options?.timeout, TIMEOUT_MIN, TIMEOUT_MAX, CONVERSION_TIMEOUT_MS),
       timezone: typeof options?.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
+      outputs: requestedOutputs,
     };
 
     await acquire(emlBuf.length);

@@ -3,6 +3,7 @@ import { chromium } from 'playwright';
 import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
 import { isPrivateHost } from './netfilter.js';
+import { buildMarkdown } from './markdown.js';
 
 // Permissive but explicit tag allowlist for email HTML.
 // Excludes by omission: script, iframe, object, embed, frame, frameset, applet,
@@ -99,6 +100,8 @@ export async function shutdownBrowser() {
   _browserPromise = null;
 }
 
+const VALID_OUTPUTS = new Set(['pdf', 'markdown']);
+
 export async function convertEmail(emlBuf, opts = {}) {
   const {
     messageId,
@@ -108,17 +111,38 @@ export async function convertEmail(emlBuf, opts = {}) {
     remoteDisabledReason = null,
     timeout = 60000,
     timezone = 'UTC',
+    outputs,
   } = opts;
+
+  // Normalize outputs: undefined/null/empty → ['pdf'] (back-compat).
+  // Anything passed must be a non-empty subset of {pdf, markdown}.
+  const requestedOutputs = Array.isArray(outputs) && outputs.length > 0
+    ? [...new Set(outputs.map(s => String(s).toLowerCase()))]
+    : ['pdf'];
+  for (const o of requestedOutputs) {
+    if (!VALID_OUTPUTS.has(o)) {
+      throw Object.assign(
+        new Error(`Invalid output format: "${o}". Allowed: pdf, markdown`),
+        { status: 400 }
+      );
+    }
+  }
+  const wantPdf = requestedOutputs.includes('pdf');
+  const wantMd = requestedOutputs.includes('markdown');
 
   const warnings = [];
 
   const mail = await simpleParser(emlBuf);
 
-  const { html, inlineCount, usedCids } = buildHtml(mail, timezone, warnings);
+  const { html, body: bodyWithImages, inlineCount, usedCids } =
+    buildHtml(mail, timezone, warnings);
 
-  const pdfBuffer = await renderPdf(html, {
-    widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings,
-  });
+  // PDF is the only path that touches Chromium — skip entirely when not asked.
+  const pdfBuffer = wantPdf
+    ? await renderPdf(html, {
+        widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings,
+      })
+    : null;
 
   const attachments = extractAttachments(mail, usedCids);
 
@@ -137,13 +161,27 @@ export async function convertEmail(emlBuf, opts = {}) {
       size: a.size,
       inline: false,
     })),
+    outputs: requestedOutputs,
     warnings,
   };
 
-  const pdfName = mail.date
-    ? formatPdfFilename(mail.date, timezone)
-    : 'email.pdf';
-  const zipBuffer = await createZip(pdfBuffer, pdfName, metadata, attachments);
+  // Common date-prefixed base name; the PDF and the MD share it so a
+  // downstream pipeline can pair them by filename stem.
+  const baseName = mail.date
+    ? formatBaseName(mail.date, timezone)
+    : 'email';
+
+  const markdownText = wantMd
+    ? buildMarkdown(mail, bodyWithImages, metadata)
+    : null;
+
+  const zipBuffer = await createZip({
+    baseName,
+    pdfBuffer,
+    markdownText,
+    metadata,
+    attachments,
+  });
 
   return { zipBuffer, metadata };
 }
@@ -397,6 +435,10 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
         break-before:auto !important;
       }
     </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${bodyWithImages}</div></body></html>`,
+    // Sanitized + cid:-resolved body, without our outer chrome (header,
+    // CSP, defensive CSS). Used by buildMarkdown so the MD output sees
+    // exactly the same content as the PDF, just without page styling.
+    body: bodyWithImages,
     inlineCount,
     usedCids,
   };
@@ -561,7 +603,13 @@ function extractAttachments(mail, usedCids = new Set()) {
   return attachments;
 }
 
-async function createZip(pdfBuffer, pdfName, metadata, attachments) {
+/**
+ * Build the result ZIP. PDF and Markdown are both optional — at least one
+ * must be present. JSON metadata sidecar is always included; attachments
+ * always go under `attachments/`. PDF and MD share the same date-prefixed
+ * base name so a downstream pipeline can pair them by filename stem.
+ */
+async function createZip({ baseName, pdfBuffer, markdownText, metadata, attachments }) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     const zip = archiver('zip', { zlib: { level: 6 } });
@@ -569,9 +617,9 @@ async function createZip(pdfBuffer, pdfName, metadata, attachments) {
     zip.on('end', () => resolve(Buffer.concat(chunks)));
     zip.on('error', reject);
 
-    const metaName = pdfName.replace(/\.pdf$/, '.json');
-    zip.append(pdfBuffer, { name: pdfName });
-    zip.append(Buffer.from(JSON.stringify(metadata, null, 2)), { name: metaName });
+    if (pdfBuffer) zip.append(pdfBuffer, { name: `${baseName}.pdf` });
+    if (markdownText != null) zip.append(Buffer.from(markdownText, 'utf8'), { name: `${baseName}.md` });
+    zip.append(Buffer.from(JSON.stringify(metadata, null, 2)), { name: `${baseName}.json` });
     for (const att of attachments) {
       zip.append(att.content, { name: `attachments/${att.filename}` });
     }
@@ -579,7 +627,9 @@ async function createZip(pdfBuffer, pdfName, metadata, attachments) {
   });
 }
 
-function formatPdfFilename(date, timezone) {
+// Date-prefixed filename stem, e.g. "2025-01-15 10-30 email" — extension
+// (`.pdf`/`.md`/`.json`) is appended by the ZIP writer.
+function formatBaseName(date, timezone) {
   const d = new Date(date);
   const pad = (n) => String(n).padStart(2, '0');
   let yyyy, mm, dd, hh, min;
@@ -596,7 +646,7 @@ function formatPdfFilename(date, timezone) {
     yyyy = d.getUTCFullYear(); mm = pad(d.getUTCMonth() + 1); dd = pad(d.getUTCDate());
     hh = pad(d.getUTCHours()); min = pad(d.getUTCMinutes());
   }
-  return `${yyyy}-${mm}-${dd} ${hh}-${min} email.pdf`;
+  return `${yyyy}-${mm}-${dd} ${hh}-${min} email`;
 }
 
 function formatDisplayDate(date, timezone) {

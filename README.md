@@ -1,6 +1,11 @@
 # eml2pdf
 
-Dockerized microservice that converts Gmail raw or `.eml` emails to a ZIP containing **PDF**, **metadata.json**, and extracted **attachments**.
+Dockerized microservice that converts Gmail raw or `.eml` emails to a ZIP containing one or both of:
+
+- a long-page **PDF** rendering (Chromium headless), and/or
+- an **LLM-friendly Markdown** rendering with inline images as `data:` URLs
+
+plus **metadata.json** and extracted **attachments**.
 
 Designed for [n8n](https://n8n.io) HTTP Request nodes.
 
@@ -43,18 +48,70 @@ curl -X POST http://localhost:3005/convert \
   --output result.zip
 ```
 
+#### Markdown for LLM consumption
+
+```bash
+curl -X POST http://localhost:3005/convert \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rawBase64Url": "RnJvbTog...",
+    "options": {
+      "outputs": ["markdown"],
+      "timezone": "Europe/Berlin"
+    }
+  }' \
+  --output result.zip
+```
+
 ### Response: `result.zip`
+
+Contents depend on `options.outputs` (defaults to `["pdf"]`). Both PDF and
+Markdown share a date-prefixed base name so a downstream pipeline can pair
+them by filename stem.
+
+`outputs: ["pdf"]` (default — back-compat with v1.0):
 
 ```
 result.zip
-├── 2025-01-15 10-30 email.pdf     # Long-page PDF rendering (date from email, timezone-aware)
+├── 2025-01-15 10-30 email.pdf     # Long-page PDF rendering
 ├── 2025-01-15 10-30 email.json    # Structured email metadata
 └── attachments/
     ├── contract.pdf
     └── photo.jpg
 ```
 
-> Filenames use the email's date formatted in the requested timezone. Format: `yyyy-mm-dd HH-MM email.pdf`
+`outputs: ["markdown"]` (LLM consumption only — no Chromium render):
+
+```
+result.zip
+├── 2025-01-15 10-30 email.md      # Markdown with inline data: image URLs
+├── 2025-01-15 10-30 email.json
+└── attachments/...
+```
+
+`outputs: ["pdf", "markdown"]` (both):
+
+```
+result.zip
+├── 2025-01-15 10-30 email.pdf
+├── 2025-01-15 10-30 email.md
+├── 2025-01-15 10-30 email.json
+└── attachments/...
+```
+
+> Filenames use the email's date formatted in the requested timezone. Stem format: `yyyy-mm-dd HH-MM email`.
+
+### Markdown output
+
+The `.md` file is designed for LLM consumption:
+
+- Email subject becomes an H1 heading.
+- From / To / CC / Date / Message-ID are emitted as a structured header block.
+- Body is converted from sanitized HTML via [turndown](https://github.com/mixmark-io/turndown) + GFM.
+- **Inline images become `![alt](data:image/...;base64,...)`** — vision-capable LLMs (Claude, GPT-4o, etc.) consume those natively.
+- HTML tables become GFM tables; lists, links, bold/italic preserved.
+- Attachments listed by filename + content type + size in their own section (their bytes are still in `attachments/`).
+- Conversion warnings (unresolved CIDs, blocked remote hosts, etc.) listed at the end.
 
 ### `GET /health`
 
@@ -66,7 +123,8 @@ result.zip
 
 | Option | Default | Description |
 |---|---|---|
-| `widthPx` | `900` | PDF width in pixels |
+| `outputs` | `["pdf"]` | Array. Subset of `["pdf", "markdown"]`. At least one required. Picking only `markdown` skips the Chromium render entirely. |
+| `widthPx` | `900` | PDF width in pixels (ignored if PDF not requested) |
 | `maxHeightPx` | `30000` | Max PDF height; taller emails get truncated + warning |
 | `loadRemoteImages` | `LOAD_REMOTE_IMAGES` env | Allow loading external images. The env var is a **ceiling**: a request can opt out (`false`), but cannot opt in if the operator disabled it via env. |
 | `timezone` | `UTC` | IANA timezone for date display in PDF header and filenames |
