@@ -134,12 +134,19 @@ export async function convertEmail(emlBuf, opts = {}) {
 
   const mail = await simpleParser(emlBuf);
 
-  const { html, body: bodyWithImages, inlineCount, usedCids } =
+  const { body: bodyRaw, inlineCount, usedCids } =
     buildHtml(mail, timezone, warnings);
+
+  // Apply the remote-URL policy statically so both PDF and Markdown see the
+  // same body, and the .md never carries http(s) URLs that would have been
+  // blocked at fetch time. The PDF render still has its own context.route
+  // as defense in depth (catches anything our static analysis missed, e.g.
+  // URLs inside @font-face rules).
+  const filteredBody = await filterRemoteUrls(bodyRaw, { loadRemoteImages, warnings });
 
   // PDF is the only path that touches Chromium — skip entirely when not asked.
   const pdfBuffer = wantPdf
-    ? await renderPdf(html, {
+    ? await renderPdf(wrapForPdf(filteredBody, mail, timezone), {
         widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings,
       })
     : null;
@@ -172,7 +179,7 @@ export async function convertEmail(emlBuf, opts = {}) {
     : 'email';
 
   const markdownText = wantMd
-    ? buildMarkdown(mail, bodyWithImages, metadata)
+    ? buildMarkdown(mail, filteredBody, metadata)
     : null;
 
   const zipBuffer = await createZip({
@@ -216,7 +223,7 @@ function normalizeCid(value = '') {
   return cid;
 }
 
-export { buildHtml as buildHtmlForTest };
+export { buildHtml as buildHtmlForTest, filterRemoteUrls as filterRemoteUrlsForTest };
 
 function buildHtml(mail, timezone = 'UTC', warnings = []) {
   const attachments = mail.attachments || [];
@@ -391,6 +398,20 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     warnings.push(`…and ${unresolvedList.length - MAX_UNRESOLVED_LISTED} more unresolved CID(s)`);
   }
 
+  return {
+    body: bodyWithImages,
+    inlineCount,
+    usedCids,
+  };
+}
+
+/**
+ * Wrap the sanitized body into a full HTML document for Chromium rendering.
+ * Pure: no I/O, no async. Separated from buildHtml so we can apply remote-URL
+ * filtering to the body in between, and reuse the same filtered body for
+ * both PDF and Markdown.
+ */
+function wrapForPdf(body, mail, timezone) {
   const ccLine = mail.cc?.text ? `<div><strong>CC:</strong> ${esc(mail.cc.text)}</div>` : '';
   const headerHtml = `
     <div style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #ccc;font-family:Arial,sans-serif;font-size:11pt;line-height:1.5">
@@ -416,8 +437,7 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     "form-action 'none'",
   ].join('; ');
 
-  return {
-    html: `<!DOCTYPE html><html><head><meta charset="utf-8">
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
       <meta http-equiv="Content-Security-Policy" content="${csp}">
       <style>
       @page { size: auto; margin: 0 }
@@ -434,14 +454,109 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
         page-break-before:auto !important;
         break-before:auto !important;
       }
-    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${bodyWithImages}</div></body></html>`,
-    // Sanitized + cid:-resolved body, without our outer chrome (header,
-    // CSP, defensive CSS). Used by buildMarkdown so the MD output sees
-    // exactly the same content as the PDF, just without page styling.
-    body: bodyWithImages,
-    inlineCount,
-    usedCids,
-  };
+    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${body}</div></body></html>`;
+}
+
+/**
+ * Apply the remote-URL policy to the sanitized body BEFORE rendering or
+ * markdown emission. Equivalent to what context.route does for the PDF
+ * fetch path, but applied statically to the HTML so:
+ *   (a) markdown output also honors the policy (the .md never includes
+ *       URLs that would have been blocked at fetch time), and
+ *   (b) the PDF render saves a network round-trip per blocked URL.
+ *
+ * Policy:
+ *   - data:, cid:, mailto:, tel:                 always pass
+ *   - http(s) with loadRemoteImages=false        blocked
+ *   - http(s) to private/loopback/IMDS host      blocked
+ *   - http(s) to public host (loadRemote=true)   pass
+ *
+ * Blocked URLs in src=/background= are replaced with empty values; blocked
+ * href= are stripped (link text remains); blocked CSS url(...) becomes
+ * url(about:blank). One aggregated warning lists the blocked hosts.
+ */
+async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
+  // Scan for all the URL-bearing forms we know to handle.
+  // Each entry: { start, end, kind, host }
+  const matches = [];
+
+  const attrRe = /\b(src|href|background)\s*=\s*(["']?)\s*(https?:\/\/[^"'\s>]+)\2/gi;
+  for (const m of body.matchAll(attrRe)) {
+    let host;
+    try { host = new URL(m[3]).hostname; } catch { continue; }
+    matches.push({ start: m.index, end: m.index + m[0].length, kind: m[1].toLowerCase(), host });
+  }
+
+  const cssRe = /url\s*\(\s*(["']?)\s*(https?:\/\/[^"'\s)]+)\1\s*\)/gi;
+  for (const m of body.matchAll(cssRe)) {
+    let host;
+    try { host = new URL(m[2]).hostname; } catch { continue; }
+    matches.push({ start: m.index, end: m.index + m[0].length, kind: 'css-url', host });
+  }
+
+  // srcset is comma-separated and parsing it correctly is fiddly. If any
+  // URL inside is http(s), we drop the entire attribute when policy blocks
+  // any of them. Conservative but safe.
+  const srcsetRe = /\bsrcset\s*=\s*(["'])([^"']*https?:\/\/[^"']*)\1/gi;
+  for (const m of body.matchAll(srcsetRe)) {
+    const urls = m[2].split(',').map(s => s.trim().split(/\s+/)[0]).filter(u => /^https?:\/\//i.test(u));
+    for (const u of urls) {
+      let host;
+      try { host = new URL(u).hostname; } catch { continue; }
+      matches.push({ start: m.index, end: m.index + m[0].length, kind: 'srcset', host, srcsetWhole: m[0] });
+    }
+  }
+
+  if (matches.length === 0) return body;
+
+  // Decide policy per unique host once.
+  const hosts = [...new Set(matches.map(m => m.host))];
+  const blocked = new Set();
+  if (!loadRemoteImages) {
+    for (const h of hosts) blocked.add(h);
+  } else {
+    const results = await Promise.all(hosts.map(h => isPrivateHost(h).catch(() => true)));
+    hosts.forEach((h, i) => { if (results[i]) blocked.add(h); });
+  }
+
+  if (blocked.size === 0) return body;
+
+  // Apply replacements right-to-left so prior indices stay valid. For
+  // srcset where multiple match entries share a range, dedup by start.
+  matches.sort((a, b) => b.start - a.start);
+  const handledRanges = new Set();
+  let out = body;
+  for (const m of matches) {
+    if (!blocked.has(m.host)) continue;
+    const rangeKey = `${m.start}-${m.end}`;
+    if (handledRanges.has(rangeKey)) continue;
+    handledRanges.add(rangeKey);
+
+    let replacement;
+    if (m.kind === 'css-url') {
+      replacement = 'url(about:blank)';
+    } else if (m.kind === 'href') {
+      replacement = '';
+    } else if (m.kind === 'srcset') {
+      replacement = '';
+    } else {
+      // src= / background=
+      replacement = `${m.kind}=""`;
+    }
+    out = out.slice(0, m.start) + replacement + out.slice(m.end);
+  }
+
+  const cause = !loadRemoteImages
+    ? 'remote loading disabled by server config (env LOAD_REMOTE_IMAGES=false; set it to true to enable)'
+    : 'private/internal host blocked';
+  const list = [...blocked].slice(0, 10);
+  warnings.push(
+    `Stripped ${blocked.size} remote URL host(s) from rendered output — ${cause}: ` +
+    list.join(', ') +
+    (blocked.size > 10 ? `, …+${blocked.size - 10}` : '')
+  );
+
+  return out;
 }
 
 async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings }) {

@@ -159,8 +159,11 @@ async function handleConvert(req, res, requestId) {
       : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
 
     // outputs: array of formats to produce. Default ['pdf'] for backward
-    // compatibility. convertEmail validates the values.
-    let requestedOutputs;
+    // compatibility. Validate here (not just in convertEmail) so we know
+    // upfront whether we need a render slot — markdown-only conversions
+    // skip Chromium and therefore don't need to wait in the render queue.
+    const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
+    let requestedOutputs = ['pdf'];
     if (options?.outputs !== undefined) {
       if (!Array.isArray(options.outputs)) {
         return jsonError(res, 400, 'options.outputs must be an array of strings ("pdf", "markdown")');
@@ -168,8 +171,15 @@ async function handleConvert(req, res, requestId) {
       if (options.outputs.length === 0) {
         return jsonError(res, 400, 'options.outputs cannot be empty');
       }
-      requestedOutputs = options.outputs;
+      const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
+      for (const o of normalized) {
+        if (!ALLOWED_OUTPUTS.has(o)) {
+          return jsonError(res, 400, `Invalid output format "${o}". Allowed: pdf, markdown`);
+        }
+      }
+      requestedOutputs = normalized;
     }
+    const needsRenderSlot = requestedOutputs.includes('pdf');
 
     const opts = {
       widthPx: clamp(options?.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
@@ -181,8 +191,13 @@ async function handleConvert(req, res, requestId) {
       outputs: requestedOutputs,
     };
 
-    await acquire(emlBuf.length);
-    acquired = true;
+    // Only acquire the render-slot semaphore for conversions that actually
+    // need Chromium. Markdown-only is parse + sanitize + turndown — light
+    // CPU work that shouldn't queue behind heavyweight PDF renders.
+    if (needsRenderSlot) {
+      await acquire(emlBuf.length);
+      acquired = true;
+    }
 
     const result = await convertEmail(emlBuf, { messageId, ...opts });
 

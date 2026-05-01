@@ -69,18 +69,59 @@ async function buildBoth(emlBuf) {
   return { md, metadata, usedCids };
 }
 
-// 1. Headers + simple body.
+// 1. YAML frontmatter + H1 + simple body.
 {
   const { md } = await buildBoth(eml(`<p>Hello <b>world</b>.</p>`));
+  // Metadata is emitted as YAML frontmatter (between two --- lines), not
+  // inline **bold** text — that's the P3 fix to prevent markdown injection
+  // via attacker-controlled subject / message-id / etc.
+  const hasFrontmatter = /^---\n[\s\S]*?\n---\n/m.test(md);
+  const hasSubjectInFm = /^subject:\s*"Quarterly Report"$/m.test(md);
+  const hasFromInFm = /^from:\s*".*alice@example\.com.*"$/m.test(md);
+  const hasToInFm = /^to:\s*\[[\s\S]*bob@example\.com[\s\S]*\]$/m.test(md);
   const hasH1 = /^# Quarterly Report/m.test(md);
-  const hasFrom = /\*\*From:\*\*[^\n]*alice@example\.com/.test(md);
-  const hasTo = /\*\*To:\*\*[^\n]*bob@example\.com/.test(md);
-  const hasDate = /\*\*Date:\*\* 2025-01-15T08:30:00\.000Z/.test(md);
   const hasBold = /\*\*world\*\*/.test(md);
   const noHtml = !/<p>|<b>/i.test(md);
-  check('basic headers + bold body',
-    hasH1 && hasFrom && hasTo && hasDate && hasBold && noHtml,
-    { hasH1, hasFrom, hasTo, hasDate, hasBold, noHtml, md: md.slice(0, 400) });
+  check('frontmatter + H1 + bold body',
+    hasFrontmatter && hasSubjectInFm && hasFromInFm && hasToInFm && hasH1 && hasBold && noHtml,
+    { hasFrontmatter, hasSubjectInFm, hasFromInFm, hasToInFm, hasH1, hasBold, noHtml,
+      md: md.slice(0, 500) });
+}
+
+// 1b. Markdown injection via subject / message-id / from is neutralized.
+{
+  const mail = await simpleParser(eml('<p>safe body</p>'));
+  const { body } = buildHtmlForTest(mail, 'UTC', []);
+  const malicious = {
+    messageId: '<a@b>\n# INJECTED-MID\n',
+    subject: '\n\n# PWNED-SUBJ\n## Subheading\n[click](javascript:x)',
+    from: 'Alice\n# INJECTED-FROM',
+    to: ['bob@x'],
+    cc: [],
+    date: '2025-01-15T08:30:00.000Z',
+    timezone: 'UTC',
+    inlineImagesResolved: 0,
+    attachments: [],
+    warnings: [],
+  };
+  const md = buildMarkdown(mail, body, malicious);
+  // No "# PWNED-SUBJ" line appears as a real heading anywhere in the doc.
+  // (Markdown headings need to be at the start of a line — `^# text`.)
+  // The escaped form `# \# PWNED-SUBJ` is fine: the leading `# ` is from
+  // OUR H1, and the `\#` is the escaped attacker hash, which renders as a
+  // visible "#" rather than promoting to a sub-heading.
+  const noPwnedHeading = !/^# PWNED-SUBJ/m.test(md);
+  const noInjectedMid = !/^# INJECTED-MID/m.test(md);
+  const noInjectedFrom = !/^# INJECTED-FROM/m.test(md);
+  // Subhheading from the subject must not become an H2.
+  const noInjectedH2 = !/^## Subheading/m.test(md);
+  // The subject text IS still present (escaped) — we don't drop content,
+  // we neutralize formatting.
+  const subjectStillPresent = /PWNED-SUBJ/.test(md);
+  check('markdown injection via metadata neutralized',
+    noPwnedHeading && noInjectedMid && noInjectedFrom && noInjectedH2 && subjectStillPresent,
+    { noPwnedHeading, noInjectedMid, noInjectedFrom, noInjectedH2, subjectStillPresent,
+      head: md.slice(0, 800) });
 }
 
 // 2. Inline image (cid:) → markdown image with data URL.

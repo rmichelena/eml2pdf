@@ -105,13 +105,26 @@ result.zip
 
 The `.md` file is designed for LLM consumption:
 
-- Email subject becomes an H1 heading.
-- From / To / CC / Date / Message-ID are emitted as a structured header block.
+- Email metadata (subject / from / to / cc / date / message-id) is emitted
+  as **YAML frontmatter** (`---`-delimited) so attacker-controlled fields
+  can't inject Markdown structure into the document. Subject also appears
+  as an escaped H1.
 - Body is converted from sanitized HTML via [turndown](https://github.com/mixmark-io/turndown) + GFM.
 - **Inline images become `![alt](data:image/...;base64,...)`** — vision-capable LLMs (Claude, GPT-4o, etc.) consume those natively.
 - HTML tables become GFM tables; lists, links, bold/italic preserved.
+- Remote URLs in the body honor the same policy as the PDF (`LOAD_REMOTE_IMAGES`
+  env + per-host private/loopback/IMDS filter). Blocked URLs are stripped
+  from `src=`/`background=`/`href=`/`url(...)` so the `.md` doesn't leak
+  tracking pixels or SSRF-style URLs to the LLM consumer.
 - Attachments listed by filename + content type + size in their own section (their bytes are still in `attachments/`).
-- Conversion warnings (unresolved CIDs, blocked remote hosts, etc.) listed at the end.
+- Conversion warnings (unresolved CIDs, stripped remote hosts, etc.) listed at the end.
+
+### Performance note: markdown-only is cheap
+
+Conversions with `outputs: ["markdown"]` (only) **skip Chromium entirely**.
+They don't take a render-slot from the `MAX_CONCURRENT_RENDERS` semaphore
+and don't queue against PDF requests under load. Only PDF conversions are
+gated by the render queue.
 
 ### `GET /health`
 

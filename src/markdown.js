@@ -73,21 +73,37 @@ export function buildMarkdown(mail, bodyWithImages, metadata) {
 
   const lines = [];
 
-  // Top: email subject as H1 if present, else generic.
-  const subject = (metadata.subject || '').trim();
-  lines.push(`# ${subject || 'Email'}`);
+  // Metadata block as YAML frontmatter. JSON.stringify gives us safe quoting
+  // for arbitrary user content (newlines, quotes, control chars) — JSON is
+  // a strict subset of YAML so the result parses as both. This is the safest
+  // way to expose attacker-controlled fields like Subject / Message-ID
+  // without risking Markdown injection (a Subject like "\n# Fake Section"
+  // would otherwise add a heading right before the body).
+  const frontmatter = {
+    subject: metadata.subject || '',
+    from: metadata.from || '',
+    to: metadata.to || [],
+    cc: metadata.cc || [],
+    date: metadata.date,
+    timezone: metadata.timezone || null,
+    message_id: metadata.messageId || null,
+  };
+  // Drop nullish to keep the block tight.
+  const fmEntries = Object.entries(frontmatter).filter(([, v]) =>
+    v !== null && v !== undefined && !(Array.isArray(v) && v.length === 0)
+  );
+  lines.push('---');
+  for (const [k, v] of fmEntries) {
+    lines.push(`${k}: ${JSON.stringify(v)}`);
+  }
+  lines.push('---');
   lines.push('');
 
-  // Structured headers as a definition-list-style block. Bold labels, plain
-  // text values. LLMs parse this trivially.
-  const fmt = (v) => Array.isArray(v) ? v.join(', ') : (v || '');
-  if (metadata.from) lines.push(`**From:** ${fmt(metadata.from)}  `);
-  if (metadata.to?.length) lines.push(`**To:** ${fmt(metadata.to)}  `);
-  if (metadata.cc?.length) lines.push(`**CC:** ${fmt(metadata.cc)}  `);
-  if (metadata.date) lines.push(`**Date:** ${metadata.date}${metadata.timezone ? ` (${metadata.timezone})` : ''}  `);
-  if (metadata.messageId) lines.push(`**Message-ID:** ${metadata.messageId}  `);
-  lines.push('');
-  lines.push('---');
+  // Subject as H1 too, but escaped. Newlines collapse to space, leading
+  // hashes / asterisks / underscores get escaped so they can't form a
+  // heading or strong/em accidentally.
+  const subject = mdEscapeInline(metadata.subject || '').trim();
+  lines.push(`# ${subject || 'Email'}`);
   lines.push('');
 
   // Body — turndown converts the sanitized HTML.
@@ -104,7 +120,11 @@ export function buildMarkdown(mail, bodyWithImages, metadata) {
     lines.push('');
     for (const att of metadata.attachments) {
       const size = typeof att.size === 'number' ? ` (${formatBytes(att.size)})` : '';
-      lines.push(`- \`${att.filename}\` — ${att.contentType}${size}`);
+      // Strip backticks from the filename — they'd break the code span.
+      // (Other filename-unsafe chars are already sanitized in convert.js.)
+      const safeName = String(att.filename).replace(/`/g, "'");
+      const safeType = String(att.contentType).replace(/`/g, "'");
+      lines.push(`- \`${safeName}\` — ${safeType}${size}`);
     }
   }
 
@@ -120,6 +140,16 @@ export function buildMarkdown(mail, bodyWithImages, metadata) {
   }
 
   return lines.join('\n') + '\n';
+}
+
+// Escape characters that have meaning inline in Markdown so attacker-controlled
+// values (subject, attachment filenames if we ever interpolate them outside
+// backticks, etc.) can't inject formatting / structure.
+function mdEscapeInline(s) {
+  return String(s)
+    .replace(/[\r\n]+/g, ' ')         // collapse newlines so a "\n# Heading" can't promote to a section
+    .replace(/[\\`*_{}\[\]()#+\-!|>]/g, (c) => `\\${c}`)
+    .trim();
 }
 
 function formatBytes(n) {

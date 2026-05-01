@@ -65,17 +65,17 @@ const FIXTURES = [
 for (const fx of FIXTURES) {
   const mail = await simpleParser(makeEml(fx.html));
   const warnings = [];
-  const { html, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
 
-  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
-  const cidGone = !/\bsrc\s*=\s*["']?\s*cid:/i.test(html);
+  const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const cidGone = !/\bsrc\s*=\s*["']?\s*cid:/i.test(body);
   const oneInlined = inlineCount === 1;
   const trackedCid = usedCids.has('sig123@example.com');
   const noWarnings = warnings.length === 0;
 
   check(fx.name, hasDataUrl && cidGone && oneInlined && trackedCid && noWarnings, {
     inlineCount, usedCids: [...usedCids], warnings,
-    cidLeft: !cidGone, snippet: html.slice(html.indexOf('<body'), html.indexOf('<body') + 200),
+    cidLeft: !cidGone, snippet: body.slice(0, 200),
   });
 }
 
@@ -130,8 +130,8 @@ ${SIG_B64}
 {
   const mail = await simpleParser(makeEml('<img src="cid:does-not-exist@example.com">'));
   const warnings = [];
-  const { html, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
-  const cidStillThere = /cid:does-not-exist/.test(html);
+  const { body, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
+  const cidStillThere = /cid:does-not-exist/.test(body);
   const perCidWarning = warnings.some(w => /Unresolved CID image: does-not-exist@example\.com/.test(w));
   check('unresolved cid: produces a per-cid warning',
     inlineCount === 0 && perCidWarning && cidStillThere,
@@ -142,9 +142,9 @@ ${SIG_B64}
 {
   const mail = await simpleParser(makeEml('<table background="cid:sig123@example.com"><tr><td>x</td></tr></table>'));
   const warnings = [];
-  const { html, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
-  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
-  const cidGone = !/background\s*=\s*["']?cid:/i.test(html);
+  const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const cidGone = !/background\s*=\s*["']?cid:/i.test(body);
   check('background="cid:..." resolved',
     hasDataUrl && cidGone && inlineCount === 1 && usedCids.has('sig123@example.com') && warnings.length === 0,
     { inlineCount, usedCids: [...usedCids], warnings });
@@ -154,20 +154,20 @@ ${SIG_B64}
 {
   const mail = await simpleParser(makeEml('<div style="background-image:url(cid:sig123@example.com)">x</div>'));
   const warnings = [];
-  const { html, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
-  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
-  const cidGone = !/url\([^)]*cid:/i.test(html);
+  const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const cidGone = !/url\([^)]*cid:/i.test(body);
   check('CSS url(cid:...) resolved',
     hasDataUrl && cidGone && inlineCount === 1 && usedCids.has('sig123@example.com') && warnings.length === 0,
-    { inlineCount, usedCids: [...usedCids], warnings, snippet: html.slice(html.indexOf('<body'), html.indexOf('<body')+300) });
+    { inlineCount, usedCids: [...usedCids], warnings, snippet: body.slice(0, 300) });
 }
 
 // CSS url('cid:...') with single quotes inside style.
 {
   const mail = await simpleParser(makeEml(`<div style="background:url('cid:sig123@example.com')">x</div>`));
   const warnings = [];
-  const { html, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
-  const hasDataUrl = html.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const { body, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
   check(`CSS url('cid:...') with single quotes resolved`,
     hasDataUrl && inlineCount === 1 && warnings.length === 0,
     { inlineCount, warnings });
@@ -226,11 +226,7 @@ const PAGINATION_FIXTURES = [
 
 for (const fx of PAGINATION_FIXTURES) {
   const mail = await simpleParser(makePlainHtmlEml(fx.html));
-  const { html } = buildHtmlForTest(mail, 'UTC', []);
-
-  // Slice to the body so we don't false-positive on our own injected <style>.
-  const bodyStart = html.indexOf('<body');
-  const body = html.slice(bodyStart);
+  const { body } = buildHtmlForTest(mail, 'UTC', []);
 
   const noPageBreak = !/\bpage-break-(?:before|after|inside)\s*:/i.test(body);
   const noBreak = !/\bbreak-(?:before|after|inside)\s*:/i.test(body);
@@ -251,8 +247,7 @@ for (const fx of PAGINATION_FIXTURES) {
   const mail = await simpleParser(makePlainHtmlEml(
     `<p style="color:red; page-break-before:always; font-size:14px; break-after: page">hi</p>`
   ));
-  const { html } = buildHtmlForTest(mail, 'UTC', []);
-  const body = html.slice(html.indexOf('<body'));
+  const { body } = buildHtmlForTest(mail, 'UTC', []);
   const colorKept = /color\s*:\s*red/.test(body);
   const fontSizeKept = /font-size\s*:\s*14px/.test(body);
   const pbGone = !/page-break-before/.test(body);
@@ -269,8 +264,7 @@ for (const fx of PAGINATION_FIXTURES) {
   const mail = await simpleParser(makePlainHtmlEml(
     `<html><head><title>SPAM</title><meta http-equiv="refresh" content="0;url=https://evil"><style>.foo{color:red}</style></head><body><p>content</p></body></html>`
   ));
-  const { html } = buildHtmlForTest(mail, 'UTC', []);
-  const body = html.slice(html.indexOf('<body'));
+  const { body } = buildHtmlForTest(mail, 'UTC', []);
   // Email's <title> text must not leak into rendered body.
   const noTitleLeak = !/SPAM/.test(body);
   // Email's <meta refresh> dropped.
