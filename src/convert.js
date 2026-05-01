@@ -59,31 +59,34 @@ const EMAIL_ALLOWED_ATTRS = [
   'datetime',
 ];
 
-// Browser singleton with generation tagging.
+// Browser singleton with generation tagging + circuit breaker.
 //
-// We track a monotonic `_generation` so that when an old browser disconnects,
-// its handler can only invalidate the singleton if no fresher launch has
-// already replaced it. Without that, this race could leak Chromiums:
+// Generation tagging:
+//   We track a monotonic `_generation` so that when an old browser disconnects,
+//   its handler can only invalidate the singleton if no fresher launch has
+//   already replaced it. Without that, the disconnected handler from a dying
+//   browser could null the promise of a brand-new launch, leaking Chromiums.
 //
-//   1. browser dies -> 'disconnected' handler will run on next tick
-//   2. caller A enters getBrowser, sees promise still set, awaits it,
-//      gets the dead browser, calls _browserPromise = null + relaunch
-//   3. caller B does the same
-//   4. 'disconnected' from step 1 fires later, nulls the (now-fresh) promise
-//   5. another caller relaunches AGAIN
+// Circuit breaker:
+//   After MAX_LAUNCH_FAILURES consecutive launch errors, the breaker OPENS
+//   and getBrowser fails fast for LAUNCH_BREAKER_COOLDOWN_MS. The 503
+//   response carries Retry-After matching the remaining cooldown so clients
+//   know when to retry. When the cooldown elapses, the breaker closes
+//   (counter reset) and the next caller gets a trial launch:
+//     - success → fully recovered
+//     - failure → counter starts fresh; if it hits MAX again, breaker
+//       reopens for another cooldown
+//   This means a transient hiccup recovers automatically; a permanent
+//   broken state still doesn't burn CPU.
 //
-// With generation, every "I want to invalidate the singleton" check first
-// confirms it's still on the same generation as the browser it observed.
-//
-// Also: bounded retries with backoff on launch failures so a broken
-// container doesn't burn CPU in a relaunch loop. After MAX_LAUNCH_FAILURES
-// consecutive failures, getBrowser rejects fast (503) until the next
-// successful launch resets the counter.
+//   Every launch failure (including the first) is tagged status=503 +
+//   retryAfter so the client gets a sensible response shape, never a 500.
 let _browserPromise = null;
 let _generation = 0;
 let _consecutiveFailures = 0;
+let _launchBlockedUntil = 0;
 const MAX_LAUNCH_FAILURES = 3;
-const LAUNCH_BACKOFF_BASE_MS = 500;
+const LAUNCH_BREAKER_COOLDOWN_MS = 30_000;
 
 const LAUNCH_ARGS = [
   '--disable-dev-shm-usage',
@@ -108,11 +111,19 @@ function getBrowser() {
     });
   }
 
-  if (_consecutiveFailures >= MAX_LAUNCH_FAILURES) {
+  // Circuit breaker.
+  const now = Date.now();
+  if (_launchBlockedUntil > now) {
+    const retryAfter = Math.max(1, Math.ceil((_launchBlockedUntil - now) / 1000));
     return Promise.reject(Object.assign(
-      new Error(`Chromium failed to launch ${_consecutiveFailures} times — check container resources / sandbox flags`),
-      { status: 503, retryAfter: 30 }
+      new Error('Chromium launch is in cooldown after repeated failures'),
+      { status: 503, retryAfter }
     ));
+  }
+  if (_launchBlockedUntil > 0) {
+    // Cooldown elapsed — close the breaker and allow a single trial launch.
+    _launchBlockedUntil = 0;
+    _consecutiveFailures = 0;
   }
 
   _generation++;
@@ -121,20 +132,42 @@ function getBrowser() {
   _browserPromise = chromium.launch({ headless: true, args: LAUNCH_ARGS })
     .then((b) => {
       _consecutiveFailures = 0;
+      _launchBlockedUntil = 0;
       b.on('disconnected', () => {
         if (_generation === myGen) _browserPromise = null;
       });
       return b;
     })
-    .catch(async (err) => {
+    .catch((err) => {
       _consecutiveFailures++;
       if (_generation === myGen) _browserPromise = null;
-      // Brief backoff so retries don't burn CPU if Chromium is broken.
-      await new Promise(r => setTimeout(r, LAUNCH_BACKOFF_BASE_MS * _consecutiveFailures));
-      throw err;
+
+      // Trip the breaker if we just hit the failure threshold.
+      let retryAfter = 5;
+      if (_consecutiveFailures >= MAX_LAUNCH_FAILURES) {
+        _launchBlockedUntil = Date.now() + LAUNCH_BREAKER_COOLDOWN_MS;
+        retryAfter = Math.ceil(LAUNCH_BREAKER_COOLDOWN_MS / 1000);
+      }
+
+      throw Object.assign(
+        new Error(`Chromium launch failed: ${err.message}`),
+        { status: 503, retryAfter }
+      );
     });
 
   return _browserPromise;
+}
+
+/** Snapshot of browser-launch state for health checks / observability. */
+export function getBrowserState() {
+  const now = Date.now();
+  return {
+    consecutiveFailures: _consecutiveFailures,
+    breakerOpen: _launchBlockedUntil > now,
+    breakerRetryAfterSec: _launchBlockedUntil > now
+      ? Math.ceil((_launchBlockedUntil - now) / 1000)
+      : 0,
+  };
 }
 
 export async function shutdownBrowser() {
@@ -520,33 +553,55 @@ function wrapForPdf(body, mail, timezone) {
  *       URLs that would have been blocked at fetch time), and
  *   (b) the PDF render saves a network round-trip per blocked URL.
  *
- * Policy:
- *   - data:, cid:, mailto:, tel:                 always pass
- *   - http(s) with loadRemoteImages=false        blocked
- *   - http(s) to private/loopback/IMDS host      blocked
- *   - http(s) to public host (loadRemote=true)   pass
+ * Two distinct policies, because not all URLs are equal:
  *
- * Blocked URLs in src=/background= are replaced with empty values; blocked
- * href= are stripped (link text remains); blocked CSS url(...) becomes
- * url(about:blank). One aggregated warning lists the blocked hosts.
+ *   FETCHED — src=, background=, srcset, CSS url(...). These trigger an
+ *   automatic network request when the page renders. The whole point of
+ *   loadRemoteImages=false is to suppress those fetches.
+ *     - data:/cid: pass.
+ *     - http(s) with loadRemoteImages=false              blocked.
+ *     - http(s) to private/loopback/IMDS host            blocked.
+ *     - http(s) to public host (loadRemoteImages=true)   pass.
+ *
+ *   NAVIGATED — href=. Just a clickable URL the consumer may follow; the
+ *   renderer doesn't fetch it. Stripping public hyperlinks degrades the
+ *   PDF/Markdown without any privacy/security benefit, so we keep them.
+ *   We DO still strip private/IMDS hyperlinks because those are SSRF-
+ *   adjacent (an LLM tool or recipient agent might pre-fetch them).
+ *     - data:/cid:/mailto:/tel: pass.
+ *     - http(s) to private/loopback/IMDS host            blocked.
+ *     - http(s) to public host                           pass (always).
+ *
+ * Replacement: blocked src=/background= become empty values; blocked
+ * srcset attributes are dropped; blocked CSS url(...) becomes
+ * url(about:blank); blocked href= is stripped (link text remains).
+ *
+ * Two aggregated warnings (one per category) list the blocked hosts.
  */
 async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
   // Scan for all the URL-bearing forms we know to handle.
-  // Each entry: { start, end, kind, host }
+  // Each entry: { start, end, kind, host, category: 'fetched' | 'navigated' }
   const matches = [];
 
   const attrRe = /\b(src|href|background)\s*=\s*(["']?)\s*(https?:\/\/[^"'\s>]+)\2/gi;
   for (const m of body.matchAll(attrRe)) {
     let host;
     try { host = new URL(m[3]).hostname; } catch { continue; }
-    matches.push({ start: m.index, end: m.index + m[0].length, kind: m[1].toLowerCase(), host });
+    const kind = m[1].toLowerCase();
+    matches.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      kind,
+      host,
+      category: kind === 'href' ? 'navigated' : 'fetched',
+    });
   }
 
   const cssRe = /url\s*\(\s*(["']?)\s*(https?:\/\/[^"'\s)]+)\1\s*\)/gi;
   for (const m of body.matchAll(cssRe)) {
     let host;
     try { host = new URL(m[2]).hostname; } catch { continue; }
-    matches.push({ start: m.index, end: m.index + m[0].length, kind: 'css-url', host });
+    matches.push({ start: m.index, end: m.index + m[0].length, kind: 'css-url', host, category: 'fetched' });
   }
 
   // srcset is comma-separated and parsing it correctly is fiddly. If any
@@ -558,23 +613,39 @@ async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
     for (const u of urls) {
       let host;
       try { host = new URL(u).hostname; } catch { continue; }
-      matches.push({ start: m.index, end: m.index + m[0].length, kind: 'srcset', host, srcsetWhole: m[0] });
+      matches.push({ start: m.index, end: m.index + m[0].length, kind: 'srcset', host, category: 'fetched' });
     }
   }
 
   if (matches.length === 0) return body;
 
-  // Decide policy per unique host once.
-  const hosts = [...new Set(matches.map(m => m.host))];
-  const blocked = new Set();
-  if (!loadRemoteImages) {
-    for (const h of hosts) blocked.add(h);
-  } else {
-    const results = await Promise.all(hosts.map(h => isPrivateHost(h).catch(() => true)));
-    hosts.forEach((h, i) => { if (results[i]) blocked.add(h); });
+  // Resolve privacy of every unique host once (parallel DNS lookups when
+  // loadRemoteImages=true; we can skip lookups entirely when it's false
+  // for the FETCHED set since we'd block everything anyway, but we still
+  // need to know privacy for href= even in that case).
+  const allHosts = [...new Set(matches.map(m => m.host))];
+  const privateOf = new Map();
+  await Promise.all(allHosts.map(async (h) => {
+    privateOf.set(h, await isPrivateHost(h).catch(() => true));
+  }));
+
+  const blockedFetched = new Set();
+  const blockedNavigated = new Set();
+
+  for (const m of matches) {
+    if (m.category === 'fetched') {
+      if (!loadRemoteImages || privateOf.get(m.host)) {
+        blockedFetched.add(m.host);
+      }
+    } else { // navigated
+      // Hyperlinks are kept unless the host is private/IMDS.
+      if (privateOf.get(m.host)) {
+        blockedNavigated.add(m.host);
+      }
+    }
   }
 
-  if (blocked.size === 0) return body;
+  if (blockedFetched.size === 0 && blockedNavigated.size === 0) return body;
 
   // Apply replacements right-to-left so prior indices stay valid. For
   // srcset where multiple match entries share a range, dedup by start.
@@ -582,6 +653,7 @@ async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
   const handledRanges = new Set();
   let out = body;
   for (const m of matches) {
+    const blocked = m.category === 'fetched' ? blockedFetched : blockedNavigated;
     if (!blocked.has(m.host)) continue;
     const rangeKey = `${m.start}-${m.end}`;
     if (handledRanges.has(rangeKey)) continue;
@@ -601,15 +673,24 @@ async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
     out = out.slice(0, m.start) + replacement + out.slice(m.end);
   }
 
-  const cause = !loadRemoteImages
-    ? 'remote loading disabled by server config (env LOAD_REMOTE_IMAGES=false; set it to true to enable)'
-    : 'private/internal host blocked';
-  const list = [...blocked].slice(0, 10);
-  warnings.push(
-    `Stripped ${blocked.size} remote URL host(s) from rendered output — ${cause}: ` +
-    list.join(', ') +
-    (blocked.size > 10 ? `, …+${blocked.size - 10}` : '')
-  );
+  const fmtList = (set) => {
+    const arr = [...set];
+    return arr.slice(0, 10).join(', ') + (arr.length > 10 ? `, …+${arr.length - 10}` : '');
+  };
+
+  if (blockedFetched.size > 0) {
+    const cause = !loadRemoteImages
+      ? 'remote loading disabled by server config (env LOAD_REMOTE_IMAGES=false; set it to true to enable)'
+      : 'private/internal host blocked';
+    warnings.push(
+      `Stripped ${blockedFetched.size} remote-fetch URL host(s) — ${cause}: ${fmtList(blockedFetched)}`
+    );
+  }
+  if (blockedNavigated.size > 0) {
+    warnings.push(
+      `Stripped ${blockedNavigated.size} hyperlink host(s) (private/internal): ${fmtList(blockedNavigated)}`
+    );
+  }
 
   return out;
 }

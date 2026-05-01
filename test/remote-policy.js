@@ -102,6 +102,62 @@ function check(label, cond, ctx = {}) {
     out === body && warnings.length === 0, { out, warnings });
 }
 
+// 7. loadRemoteImages=false MUST keep public hyperlinks intact (they're
+// just clickable URLs — not auto-fetched). This is the P2 fix.
+{
+  const body = `
+    <p>See <a href="https://1.1.1.1/docs">docs</a> for details.</p>
+    <img src="https://1.1.1.1/logo.png" alt="logo">
+  `;
+  const warnings = [];
+  const out = await filterRemoteUrlsForTest(body, { loadRemoteImages: false, warnings });
+  // Public href survived even though loadRemoteImages=false (it doesn't
+  // trigger an auto-fetch, just gives the consumer a clickable URL).
+  const publicHrefKept = /<a href="https:\/\/1\.1\.1\.1\/docs">docs<\/a>/.test(out);
+  // Public src to the same host was stripped (it WOULD auto-fetch).
+  const publicSrcStripped = !/<img src="https:\/\/1\.1\.1\.1\/logo/.test(out);
+  // Only ONE warning ("remote-fetch ... env LOAD_REMOTE_IMAGES=false"), no
+  // "hyperlink host(s)" warning because the public hyperlink was kept.
+  const fetchWarn = warnings.some(w => /remote-fetch URL host/.test(w));
+  const noLinkWarn = !warnings.some(w => /hyperlink host/.test(w));
+  check('loadRemoteImages=false keeps public href but strips public src',
+    publicHrefKept && publicSrcStripped && fetchWarn && noLinkWarn,
+    { publicHrefKept, publicSrcStripped, fetchWarn, noLinkWarn, out, warnings });
+}
+
+// 8. Private hyperlinks are still stripped regardless of loadRemoteImages
+// (an LLM tool / agent might pre-fetch them — SSRF-adjacent risk).
+{
+  const body = `
+    <a href="https://1.1.1.1/public">public</a>
+    <a href="http://169.254.169.254/imds">imds</a>
+    <a href="http://10.0.0.5/internal">internal</a>
+  `;
+  // With loadRemoteImages=true:
+  {
+    const warnings = [];
+    const out = await filterRemoteUrlsForTest(body, { loadRemoteImages: true, warnings });
+    const publicHrefKept = /href="https:\/\/1\.1\.1\.1\/public"/.test(out);
+    const imdsHrefStripped = !/169\.254\.169\.254/.test(out) && /imds<\/a>/.test(out);
+    const rfcHrefStripped = !/10\.0\.0\.5/.test(out) && /internal<\/a>/.test(out);
+    const linkWarn = warnings.some(w => /hyperlink host/.test(w) && /private\/internal/.test(w));
+    check('private hyperlinks stripped even with loadRemoteImages=true',
+      publicHrefKept && imdsHrefStripped && rfcHrefStripped && linkWarn,
+      { publicHrefKept, imdsHrefStripped, rfcHrefStripped, linkWarn, out, warnings });
+  }
+  // With loadRemoteImages=false, same: private hrefs stripped, public kept.
+  {
+    const warnings = [];
+    const out = await filterRemoteUrlsForTest(body, { loadRemoteImages: false, warnings });
+    const publicHrefKept = /href="https:\/\/1\.1\.1\.1\/public"/.test(out);
+    const imdsHrefStripped = !/169\.254\.169\.254/.test(out);
+    const rfcHrefStripped = !/10\.0\.0\.5/.test(out);
+    check('hyperlink policy independent of loadRemoteImages',
+      publicHrefKept && imdsHrefStripped && rfcHrefStripped,
+      { publicHrefKept, imdsHrefStripped, rfcHrefStripped, out });
+  }
+}
+
 if (fail) {
   console.error(`\n${fail} test(s) failed`);
   process.exit(1);

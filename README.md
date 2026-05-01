@@ -270,8 +270,15 @@ Gmail → Search Messages
   beacons in the email**. The container's IP / TLS fingerprint will
   appear in those requests. Set to `false` (or run behind an outbound
   proxy you control) if that's a concern.
-- Static URL filter strips http(s) URLs to private/loopback/IMDS hosts from
-  both the PDF render and the Markdown output
+- Static URL filter applied to both PDF and Markdown output, with two
+  separate policies:
+  - **Auto-fetched** URLs (`src=`, `background=`, `srcset`, CSS `url(...)`)
+    are gated by `LOAD_REMOTE_IMAGES` *and* host privacy. Stripped when
+    blocked.
+  - **Navigated** URLs (`href=`) are not auto-fetched, only clickable. They
+    are kept regardless of `LOAD_REMOTE_IMAGES`, but private/loopback/IMDS
+    hosts are always stripped (an LLM agent or recipient mailer may pre-
+    fetch the URL — SSRF-adjacent).
 - Bound queue (bytes-of-payload) with 503 + Retry-After when full
 - Filenames sanitized
 - Container runs as `pwuser`, `cap_drop: ALL`, `no-new-privileges`
