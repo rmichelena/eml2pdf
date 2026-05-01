@@ -263,24 +263,41 @@ function readJsonBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let bytes = 0;
+    let settled = false;
+
+    const safeReject = (e) => {
+      if (settled) return;
+      settled = true;
+      try { req.destroy(); } catch { /* ignore */ }
+      reject(e);
+    };
+    const safeResolve = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+
     req.on('data', (chunk) => {
+      if (settled) return;
       bytes += chunk.length;
       if (bytes > maxBytes) {
-        reject(Object.assign(new Error('Request too large'), { status: 413 }));
-        req.destroy();
+        safeReject(Object.assign(new Error('Request too large'), { status: 413 }));
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (settled) return;
       try {
         const text = Buffer.concat(chunks).toString('utf8');
-        resolve(JSON.parse(text));
+        safeResolve(JSON.parse(text));
       } catch {
-        reject(Object.assign(new Error('Invalid JSON'), { status: 400 }));
+        safeReject(Object.assign(new Error('Invalid JSON'), { status: 400 }));
       }
     });
-    req.on('error', reject);
+    req.on('error', safeReject);
+    req.on('aborted', () =>
+      safeReject(Object.assign(new Error('Request aborted'), { status: 400 })));
   });
 }
 

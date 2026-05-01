@@ -1,6 +1,25 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
 
+// Network-policy gate for the renderer. Resolves a hostname / IP and
+// reports whether it points at a private/internal/IMDS target.
+//
+// LIMITATIONS:
+// - We do a `dns.lookup()` here, but Chromium's runtime fetch path uses
+//   its own resolver. A malicious authoritative DNS server can answer
+//   "good IP" to us and "bad IP" (or change between resolutions) to
+//   Chromium — the classic DNS rebinding window. To close this fully you
+//   need to either fetch the resource yourself with the resolved IP
+//   forced, or front the renderer with an outbound proxy that pins
+//   resolution. We DON'T currently do that; this filter is mitigation,
+//   not enforcement. See the README "Security" section.
+// - We don't follow HTTP redirects ourselves; Chromium does. Each redirect
+//   hop reaches the route handler again, so a redirect to a private host
+//   is also blocked at fetch time — but a Markdown-only conversion (which
+//   uses the static URL filter, not the route handler) doesn't see the
+//   redirect target. This is acceptable because we strip the original
+//   URL whose host check already covers it.
+//
 // Hosts that always resolve to internal targets — block by name too,
 // in case DNS is poisoned or the host file is hostile.
 const HOSTNAME_DENYLIST = new Set([
@@ -9,8 +28,26 @@ const HOSTNAME_DENYLIST = new Set([
   'metadata',
 ]);
 
+// Bounded LRU-ish DNS-result cache. A single bad email could otherwise
+// reference thousands of unique hosts and grow the map unbounded.
 const cache = new Map(); // host → { until: ms, private: bool }
 const TTL_MS = 30_000;
+const MAX_DNS_CACHE_SIZE = parseInt(process.env.MAX_DNS_CACHE_SIZE || '5000', 10);
+
+function cacheSet(host, value) {
+  if (cache.size >= MAX_DNS_CACHE_SIZE) {
+    // FIFO eviction — Map preserves insertion order, so the first key is
+    // the oldest. Evict ~10% to amortize the cleanup cost.
+    const toEvict = Math.max(1, Math.floor(MAX_DNS_CACHE_SIZE * 0.1));
+    const it = cache.keys();
+    for (let i = 0; i < toEvict; i++) {
+      const k = it.next();
+      if (k.done) break;
+      cache.delete(k.value);
+    }
+  }
+  cache.set(host, value);
+}
 
 export async function isPrivateHost(host) {
   if (!host) return true;
@@ -29,14 +66,14 @@ export async function isPrivateHost(host) {
   try {
     addrs = await dns.lookup(lower, { all: true, verbatim: true });
   } catch {
-    cache.set(lower, { until: Date.now() + TTL_MS, private: true });
+    cacheSet(lower, { until: Date.now() + TTL_MS, private: true });
     return true; // fail closed
   }
 
   // If ANY resolved address is private, treat the host as private.
   // This is conservative but defeats DNS rebinding/multi-A tricks.
   const isPriv = addrs.some(a => isPrivateIp(a.address));
-  cache.set(lower, { until: Date.now() + TTL_MS, private: isPriv });
+  cacheSet(lower, { until: Date.now() + TTL_MS, private: isPriv });
   return isPriv;
 }
 
@@ -74,7 +111,9 @@ function isPrivateIp4(ip) {
 function isPrivateIp6(ip) {
   const lower = ip.toLowerCase();
   if (lower === '::' || lower === '::1') return true;
-  if (lower.startsWith('fe80:') || lower.startsWith('fe80::')) return true; // link-local
+  // Link-local is the entire fe80::/10 range, not just fe80::/16. The first
+  // 10 bits are 1111 1110 10, so the first hextet covers fe80–febf.
+  if (/^fe[89ab][0-9a-f]:/i.test(lower)) return true;
   if (/^f[cd][0-9a-f]{2}:/.test(lower)) return true;                         // ULA fc00::/7
   if (lower.startsWith('ff')) return true;                                    // multicast
   if (lower.startsWith('64:ff9b::')) return true;                             // NAT64

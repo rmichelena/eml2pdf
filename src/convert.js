@@ -59,35 +59,81 @@ const EMAIL_ALLOWED_ATTRS = [
   'datetime',
 ];
 
+// Browser singleton with generation tagging.
+//
+// We track a monotonic `_generation` so that when an old browser disconnects,
+// its handler can only invalidate the singleton if no fresher launch has
+// already replaced it. Without that, this race could leak Chromiums:
+//
+//   1. browser dies -> 'disconnected' handler will run on next tick
+//   2. caller A enters getBrowser, sees promise still set, awaits it,
+//      gets the dead browser, calls _browserPromise = null + relaunch
+//   3. caller B does the same
+//   4. 'disconnected' from step 1 fires later, nulls the (now-fresh) promise
+//   5. another caller relaunches AGAIN
+//
+// With generation, every "I want to invalidate the singleton" check first
+// confirms it's still on the same generation as the browser it observed.
+//
+// Also: bounded retries with backoff on launch failures so a broken
+// container doesn't burn CPU in a relaunch loop. After MAX_LAUNCH_FAILURES
+// consecutive failures, getBrowser rejects fast (503) until the next
+// successful launch resets the counter.
 let _browserPromise = null;
+let _generation = 0;
+let _consecutiveFailures = 0;
+const MAX_LAUNCH_FAILURES = 3;
+const LAUNCH_BACKOFF_BASE_MS = 500;
+
+const LAUNCH_ARGS = [
+  '--disable-dev-shm-usage',
+  '--no-sandbox',
+  '--disable-gpu',
+  '--disable-software-rasterizer',
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-sync',
+  '--no-first-run',
+];
 
 function getBrowser() {
   if (_browserPromise) {
-    return _browserPromise.then(async (b) => {
+    const myGen = _generation;
+    return _browserPromise.then((b) => {
       if (b.isConnected()) return b;
-      _browserPromise = null;
+      // Browser is dead. Only invalidate if a newer launch hasn't already
+      // taken over (in which case _generation would have advanced).
+      if (_generation === myGen) _browserPromise = null;
       return getBrowser();
     });
   }
-  _browserPromise = chromium.launch({
-    headless: true,
-    args: [
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--disable-sync',
-      '--no-first-run',
-    ],
-  }).then((b) => {
-    b.on('disconnected', () => { _browserPromise = null; });
-    return b;
-  }).catch((err) => {
-    _browserPromise = null;
-    throw err;
-  });
+
+  if (_consecutiveFailures >= MAX_LAUNCH_FAILURES) {
+    return Promise.reject(Object.assign(
+      new Error(`Chromium failed to launch ${_consecutiveFailures} times — check container resources / sandbox flags`),
+      { status: 503, retryAfter: 30 }
+    ));
+  }
+
+  _generation++;
+  const myGen = _generation;
+
+  _browserPromise = chromium.launch({ headless: true, args: LAUNCH_ARGS })
+    .then((b) => {
+      _consecutiveFailures = 0;
+      b.on('disconnected', () => {
+        if (_generation === myGen) _browserPromise = null;
+      });
+      return b;
+    })
+    .catch(async (err) => {
+      _consecutiveFailures++;
+      if (_generation === myGen) _browserPromise = null;
+      // Brief backoff so retries don't burn CPU if Chromium is broken.
+      await new Promise(r => setTimeout(r, LAUNCH_BACKOFF_BASE_MS * _consecutiveFailures));
+      throw err;
+    });
+
   return _browserPromise;
 }
 
@@ -201,7 +247,13 @@ export async function convertEmail(emlBuf, opts = {}) {
 // blocks and to inline style attributes alike.
 function stripPaginationCss(css = '') {
   return String(css)
-    // @page rules (any prefix, like `@page WordSection1 { ... }`)
+    // @page rules (any prefix, like `@page WordSection1 { ... }`).
+    // NOTE: this only matches blocks whose body has no nested braces. CSS
+    // doesn't allow nested braces inside @page (margin boxes use @-rules,
+    // but those are themselves at-rules, not nested literal `{}`), so this
+    // is correct for valid CSS. Pathological / malformed input could slip
+    // some declarations past, but the per-declaration regex below catches
+    // the property names regardless of where they sit.
     .replace(/@page\b[^{]*\{[^{}]*\}/gi, '')
     // page-break-* / break-* / page declarations (with or without trailing ;)
     .replace(
@@ -256,10 +308,13 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     disallowedTagsMode: 'discard',
     selfClosing: ['img', 'br', 'hr', 'col', 'wbr', 'source', 'area'],
     // Tags whose entire text content is dropped alongside the tag, regardless
-    // of allowedTags. Default covers script/style/textarea/option/noscript;
-    // we add 'title' so the email's `<head><title>SPAM</title></head>` doesn't
-    // leak its text into our rendered body when the head is unwrapped.
-    nonTextTags: ['script', 'style', 'textarea', 'option', 'noscript', 'title'],
+    // of allowedTags. We deliberately omit 'style' here: htmlparser2 (the
+    // parser sanitize-html uses) treats <style> as a special raw-text element
+    // anyway, and listing it here was redundant in current versions and
+    // fragile across upgrades. We do add 'title' so the email's
+    // `<head><title>SPAM</title></head>` doesn't leak its text into our
+    // rendered body when the head is unwrapped to <div>.
+    nonTextTags: ['script', 'textarea', 'option', 'noscript', 'title'],
     transformTags: {
       // Strip on* handlers, dangerous URL schemes, and pagination CSS from
       // inline style="..." attributes on any tag.

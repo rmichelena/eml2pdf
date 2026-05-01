@@ -261,10 +261,41 @@ Gmail → Search Messages
 
 - Configurable request size limit (default 50 MB)
 - Per-conversion timeout (default 60s)
-- Remote resources blocked by default
+- HTML sanitized (no scripts/iframes/forms/object/embed/meta-refresh; pagination CSS stripped)
+- JS disabled in the rendering BrowserContext
+- Permissive CSP injected for the Chromium render
+- Remote resources gated by `LOAD_REMOTE_IMAGES` env var (acts as a ceiling).
+  When `true` (the compose default), the renderer will issue HTTP(S)
+  requests to public hosts — **including any tracking pixels and
+  beacons in the email**. The container's IP / TLS fingerprint will
+  appear in those requests. Set to `false` (or run behind an outbound
+  proxy you control) if that's a concern.
+- Static URL filter strips http(s) URLs to private/loopback/IMDS hosts from
+  both the PDF render and the Markdown output
+- Bound queue (bytes-of-payload) with 503 + Retry-After when full
 - Filenames sanitized
-- No unnecessary external JavaScript execution
-- Logs without sensitive email content
+- Container runs as `pwuser`, `cap_drop: ALL`, `no-new-privileges`
+- Logs without sensitive email content (only request id, sizes, durations)
+
+### `API_KEY` authentication
+
+If set, every `POST /convert` must carry an `X-API-Key: <value>` header
+matching the env var (compared with `crypto.timingSafeEqual`). When unset,
+`/convert` is open — only safe behind a trusted reverse proxy or on a
+private Docker network.
+
+Operational notes:
+
+- **Use ≥32 random bytes** (e.g. `openssl rand -hex 32` or `head -c32
+  /dev/urandom | base64`). Short or guessable keys defeat the protection.
+- **Always run behind TLS** (reverse proxy or load balancer) when exposed
+  beyond loopback. The default compose file binds `127.0.0.1:3005` only
+  for that reason — moving to a public bind is opt-in and should be paired
+  with TLS + this header.
+- The key is logged on **invalid attempts** only as a 401, never with the
+  attempted value. Don't echo `X-API-Key` in upstream debug logs.
+- Rotate via env var update + restart; in-flight requests with the old key
+  finish before the process exits.
 
 ## License
 
