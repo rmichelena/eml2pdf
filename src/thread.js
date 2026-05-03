@@ -15,8 +15,7 @@
 import { simpleParser } from 'mailparser';
 import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
-import TurndownService from 'turndown';
-import { gfm } from 'turndown-plugin-gfm';
+import { getTurndownService, mdEscapeInline, formatBytes, formatTimestampStem, formatDateSuffix } from './textutil.js';
 
 import {
   buildHtmlForTest as buildSingleHtml,
@@ -158,22 +157,6 @@ export function stripQuotesText(text) {
 }
 
 // ─── Attachment deduplication ─────────────────────────────────────────
-
-function formatDateSuffix(date, timezone) {
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, '0');
-  try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false,
-    }).formatToParts(d);
-    const get = (type) => parts.find(p => p.type === type)?.value || '00';
-    return `${get('year')}-${get('month')}-${get('day')}_${get('hour')}-${get('minute')}`;
-  } catch {
-    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}_${pad(d.getUTCHours())}-${pad(d.getUTCMinutes())}`;
-  }
-}
 
 /**
  * Deduplicate attachments by filename across all messages.
@@ -320,37 +303,8 @@ ${parts.join('\n')}
 
 // ─── Thread Markdown builder ──────────────────────────────────────────
 
-function initTurndown() {
-  const td = new TurndownService({
-    headingStyle: 'atx',
-    bulletListMarker: '-',
-    codeBlockStyle: 'fenced',
-    emDelimiter: '_',
-    linkStyle: 'inlined',
-  });
-  td.use(gfm);
-  td.addRule('drop-style', {
-    filter: ['style', 'meta', 'title', 'link'],
-    replacement: () => '',
-  });
-  return td;
-}
-
-function mdEscapeInline(s) {
-  return String(s)
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/[\\`*_{}\[\]()#+\-!|>]/g, c => `\\${c}`)
-    .trim();
-}
-
-function formatBytes(n) {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function buildThreadMarkdown(messages, threadMeta, timezone) {
-  const td = initTurndown();
+  const td = getTurndownService();
   const lines = [];
 
   // YAML frontmatter
@@ -428,22 +382,6 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
 }
 
 // ─── Date formatting for filenames ────────────────────────────────────
-
-function formatThreadBaseName(date, timezone) {
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, '0');
-  try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false,
-    }).formatToParts(d);
-    const get = (type) => parts.find(p => p.type === type)?.value || '00';
-    return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}-${get('minute')} thread`;
-  } catch {
-    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}-${pad(d.getUTCMinutes())} thread`;
-  }
-}
 
 // ─── Main thread conversion ──────────────────────────────────────────
 
@@ -573,7 +511,7 @@ export async function convertThread(rawMessages, opts = {}) {
   // Thread metadata
   const firstDate = parsedMessages[0].date;
   const lastDate = parsedMessages[parsedMessages.length - 1].date;
-  const baseName = formatThreadBaseName(lastDate, timezone);
+  const baseName = formatTimestampStem(lastDate, timezone, 'thread');
 
   const participants = [...new Set(
     parsedMessages.flatMap(m => [m.from, ...m.to, ...m.cc]).filter(Boolean)
