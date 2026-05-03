@@ -102,7 +102,7 @@ export function stripQuotesHtml(html) {
     // Find the separator in plain text (strip tags completely for alignment)
     const plainText = result.replace(/<[^>]+>/g, '');
     const m = plainText.match(pat);
-    if (!m || m.index > plainText.length * 0.5) continue;
+    if (!m) continue;
 
     // Walk the HTML tracking text position, remembering last block-tag opening.
     // Both plainText and the walk strip tags completely (no space), so
