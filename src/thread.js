@@ -87,29 +87,60 @@ export function stripQuotesHtml(html) {
   //   <p>my reply</p><div>On Mon, Bob wrote:</div><div>previous content</div>
   // We find the first quote-separator text in the HTML and cut everything from
   // the start of its enclosing block tag onwards.
+  //
+  // Strategy: convert HTML to lines (block-element boundaries → newlines),
+  // match separator patterns anchored to start-of-line with `^`, then map
+  // the matched line's position back into the original HTML.
+  //
+  // The `^` anchor + multiline flag ensures we only match separator text that
+  // occupies its own block element, not embedded in running paragraph text.
   const separatorPatterns = [
-    /On .+ wrote:/i,                          // English
-    /El .+ escribió:/i,                       // Spanish
-    /Le .+ a écrit\s*:/i,                     // French
-    /Am .+ schrieb .+:/i,                     // German (covers "eschrieben"/"geschrieben")
-    /.+ ha scritto:/i,                        // Italian
-    /.+ escreveu:/i,                          // Portuguese
-    /-{3,}\s*Original Message\s*-{3,}/i,      // Outlook EN
-    /-{3,}\s*Mensaje original\s*-{3,}/i,      // Outlook ES
+    /^On .{1,80}? wrote:/im,                    // English
+    /^El .{1,80}? escribió:/im,                 // Spanish
+    /^Le .{1,80}? a écrit\s*:/im,               // French
+    /^Am .{1,80}? schrieb/im,                    // German
+    /^.{1,80}? ha scritto:/im,                  // Italian
+    /^.{1,80}? escreveu:/im,                    // Portuguese
+    /^-{3,}\s*Original Message\s*-{3,}/im,      // Outlook EN
+    /^-{3,}\s*Mensaje original\s*-{3,}/im,      // Outlook ES
   ];
 
   for (const pat of separatorPatterns) {
-    // Find the separator in plain text (strip tags completely for alignment)
-    const plainText = result.replace(/<[^>]+>/g, '');
+    // Build plain text with newlines at block-element closing tags.
+    // `^` in multiline mode matches after each \n → aligns with element boundaries.
+    const plainText = result
+      .replace(/<\/(?:div|p|blockquote|section|article|aside|header|footer|main)>/gi, '\n')
+      .replace(/<[^>]+>/g, '');
     const m = plainText.match(pat);
     if (!m) continue;
 
-    // Walk the HTML tracking text position, remembering last block-tag opening.
-    // Both plainText and the walk strip tags completely (no space), so
-    // textIdx stays aligned with m.index.
-    let htmlIdx = 0, textIdx = 0, lastBlockOpen = -1;
+    // Guard: separator must be at start of a line (position 0 or after \n).
+    if (m.index > 0 && plainText[m.index - 1] !== '\n') continue;
+
+    // Map the match position from plainText (with newlines) to the HTML.
+    // We walk the HTML, counting only text characters (skipping tags).
+    // Newlines inserted by block-element boundaries count as 1 char each.
+    // When our text counter reaches m.index, we've found the HTML position
+    // of the separator text.
+    //
+    // We also track lastBlockOpen: the HTML position of the last opening
+    // block tag before the separator — this is where we cut.
+    const targetTextPos = m.index;
+    let htmlIdx = 0, textIdx = 0, lastBlockOpen = -1, prevCharWasNewline = true;
+
     while (htmlIdx < result.length) {
       if (result[htmlIdx] === '<') {
+        // Closing block tag → emit newline in text coordinate space
+        const closeMatch = result.slice(htmlIdx).match(
+          /^<\/(div|p|blockquote|section|article|aside|header|footer|main)>/i
+        );
+        if (closeMatch) {
+          textIdx++; // count the newline
+          prevCharWasNewline = true;
+          htmlIdx += closeMatch[0].length;
+          continue;
+        }
+        // Opening block tag → record position
         const rest = result.slice(htmlIdx);
         if (/^<(div|p|blockquote|section|article|aside|header|footer|main)\b[^>]*>/i.test(rest)) {
           lastBlockOpen = htmlIdx;
@@ -118,10 +149,10 @@ export function stripQuotesHtml(html) {
         if (closeBracket === -1) break;
         htmlIdx = closeBracket + 1;
       } else {
-        // Check if we've reached or passed the separator position
-        if (textIdx >= m.index) break;
+        if (textIdx >= targetTextPos) break;
         textIdx++;
         htmlIdx++;
+        prevCharWasNewline = false;
       }
     }
 
