@@ -40,47 +40,80 @@ const QUOTE_SEPARATOR_RE =
   /^\s*(?:On .+ wrote:|El .+ escribió?:|De:|From:|-----Original Message-----)/i;
 
 /**
- * Strip quoted blocks from HTML body.
- * Removes elements matching known quote patterns.
+ * Strip quoted blocks from HTML body using DOM-aware parsing.
+ *
+ * Handles:
+ *   - <blockquote class="gmail_quote">
+ *   - <div class="gmail_quote">
+ *   - <blockquote type="cite">
+ *   - Generic <blockquote> starting with quote separators
+ *   - Outlook/Apple Mail pattern: <div>On ... wrote:</div> followed by siblings
+ *   - "-----Original Message-----" separators
+ *   - "De:" / "From:" separators in block elements
  */
 export function stripQuotesHtml(html) {
   if (!html) return html;
+
+  // Phase 1: Remove known quote containers via regex (these are well-bounded)
   let result = html;
 
-  // Remove blockquote.gmail_quote and its contents
+  // Remove blockquote.gmail_quote (greedy to catch nested content)
   result = result.replace(
-    /<blockquote[^>]*class=["'][^"']*gmail_quote[^"']*["'][^>]*>[\s\S]*?<\/blockquote>/gi,
+    /<blockquote[^>]*class=["'][^"']*gmail_quote[^"']*["'][^>]*>[\s\S]*<\/blockquote>/gi,
     ''
   );
 
   // Remove div.gmail_quote and contents
   result = result.replace(
-    /<div[^>]*class=["'][^"']*gmail_quote[^"']*["'][^>]*>[\s\S]*?<\/div>/gi,
+    /<div[^>]*class=["'][^"']*gmail_quote[^"']*["'][^>]*>[\s\S]*<\/div>/gi,
     ''
   );
 
   // Remove blockquote[type="cite"] and contents
   result = result.replace(
-    /<blockquote[^>]*type=["']cite["'][^>]*>[\s\S]*?<\/blockquote>/gi,
+    /<blockquote[^>]*type=["']cite["'][^>]*>[\s\S]*<\/blockquote>/gi,
     ''
   );
 
-  // Remove generic <blockquote> blocks that start with a quote separator
-  result = result.replace(
-    /<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gi,
-    (match, inner) => {
-      const textContent = inner.replace(/<[^>]+>/g, '').trim();
-      if (QUOTE_SEPARATOR_RE.test(textContent)) {
-        return '';
+  // Phase 2: Outlook/Apple Mail pattern stripping.
+  // These clients don't wrap quotes in blockquotes — they use plain <div>/<p>:
+  //   <p>my reply</p><div>On Mon, Bob wrote:</div><div>previous content</div>
+  // We find the first quote-separator text in the HTML and cut everything from
+  // the start of its enclosing block tag onwards.
+  const separatorPatterns = [
+    /On .+ (wrote|eschrieben|escribió|ha escrito):/i,
+    /El .+ escribió:/i,
+    /-{3,}\s*Original Message\s*-{3,}/i,
+  ];
+
+  for (const pat of separatorPatterns) {
+    // Find the separator in plain text
+    const plainText = result.replace(/<[^>]+>/g, ' ');
+    const m = plainText.match(pat);
+    if (!m || m.index > plainText.length * 0.5) continue;
+
+    // Walk the HTML tracking text position, remembering last block-tag opening
+    let htmlIdx = 0, textIdx = 0, lastBlockOpen = -1;
+    while (htmlIdx < result.length && textIdx < m.index) {
+      if (result[htmlIdx] === '<') {
+        const rest = result.slice(htmlIdx);
+        if (/^<(div|p|blockquote|section|article|aside|header|footer|main)\b[^>]*>/i.test(rest)) {
+          lastBlockOpen = htmlIdx;
+        }
+        const closeBracket = result.indexOf('>', htmlIdx);
+        if (closeBracket === -1) break;
+        htmlIdx = closeBracket + 1;
+      } else {
+        textIdx++;
+        htmlIdx++;
       }
-      // Check if content starts with quoted lines
-      const firstLine = textContent.split('\n')[0];
-      if (/^>\s?/.test(firstLine.trim())) {
-        return '';
-      }
-      return match;
     }
-  );
+
+    if (lastBlockOpen >= 0 && lastBlockOpen < result.length - 10) {
+      result = result.slice(0, lastBlockOpen);
+    }
+    break;
+  }
 
   return result;
 }
@@ -140,47 +173,67 @@ function formatDateSuffix(date, timezone) {
  */
 function dedupAttachments(allAttachments) {
   // Group attachments by original filename, preserving order
-  const groups = new Map(); // filename → [{ att, msgDate, index }]
+  const groups = new Map(); // filename → [{ att, index }]
 
   for (let i = 0; i < allAttachments.length; i++) {
     const att = allAttachments[i];
-    const name = att.filename;
-    if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push({ att, index: i });
+    if (!groups.has(att.filename)) groups.set(att.filename, []);
+    groups.get(att.filename).push({ att, index: i });
   }
 
   const result = new Array(allAttachments.length).fill(null);
+  // Track all emitted filenames to guarantee global uniqueness.
+  // This catches collisions where a date-stamped name accidentally
+  // matches an unrelated original filename.
+  const emitted = new Set();
+
+  function uniqueName(candidate) {
+    if (!emitted.has(candidate)) {
+      emitted.add(candidate);
+      return candidate;
+    }
+    // Collision — append numeric suffix until unique
+    const dot = candidate.lastIndexOf('.');
+    const ext = dot > 0 ? candidate.slice(dot) : '';
+    const base = dot > 0 ? candidate.slice(0, dot) : candidate;
+    let n = 1;
+    let name;
+    do { name = `${base}_${n}${ext}`; n++; } while (emitted.has(name));
+    emitted.add(name);
+    return name;
+  }
 
   for (const [, entries] of groups) {
     if (entries.length === 1) {
-      // No conflict — keep as-is
-      result[entries[0].index] = entries[0].att;
+      const att = entries[0].att;
+      att.filename = uniqueName(att.filename);
+      delete att._msgDate;
+      delete att._msgDateStr;
+      result[entries[0].index] = att;
       continue;
     }
 
     // Sort by message date ascending (oldest first)
-    // The att.msgDate was set in convertThread before calling dedupAttachments
-    entries.sort((a, b) => {
-      const da = a.att._msgDate || 0;
-      const db = b.att._msgDate || 0;
-      return da - db;
-    });
+    entries.sort((a, b) => (a.att._msgDate || 0) - (b.att._msgDate || 0));
 
-    // Oldest entries get date-stamped names; the last (newest) keeps the original
+    // Process oldest first — they get date-stamped names.
+    // The newest (last) keeps the original name.
     for (let j = 0; j < entries.length; j++) {
-      const { att, index } = entries[j];
+      const att = entries[j].att;
       if (j < entries.length - 1) {
         // Rename with date suffix
         const dot = att.filename.lastIndexOf('.');
         const ext = dot > 0 ? att.filename.slice(dot) : '';
         const base = dot > 0 ? att.filename.slice(0, dot) : att.filename;
         const dateSuffix = att._msgDateStr || String(j + 1);
-        att.filename = `${base}_${dateSuffix}${ext}`;
+        att.filename = uniqueName(`${base}_${dateSuffix}${ext}`);
+      } else {
+        // Newest keeps original name (but still dedup-checked)
+        att.filename = uniqueName(att.filename);
       }
-      // newest entry keeps original filename
       delete att._msgDate;
       delete att._msgDateStr;
-      result[index] = att;
+      result[entries[j].index] = att;
     }
   }
 

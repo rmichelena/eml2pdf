@@ -364,6 +364,9 @@ async function handleConvertThread(req, res, requestId) {
     if (!res.headersSent) {
       if (err.retryAfter) {
         res.setHeader('Retry-After', String(err.retryAfter));
+        res.setHeader('X-Queue-Limit-MB', String(MAX_QUEUED_EML_MB));
+        res.setHeader('X-Queued-Bytes', String(queuedBytes));
+        res.setHeader('X-In-Flight-Renders', String(inFlight));
       }
       jsonError(res, status, clientMsg);
     }
