@@ -1,6 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { convertEmail, shutdownBrowser } from './convert.js';
+import { convertThread } from './thread.js';
 import { parseMultipart } from './multipart.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -108,6 +109,13 @@ const server = http.createServer(async (req, res) => {
       return jsonError(res, 401, 'Unauthorized');
     }
     return handleConvert(req, res, requestId);
+  }
+
+  if (req.method === 'POST' && req.url === '/convert-thread') {
+    if (!checkAuth(req)) {
+      return jsonError(res, 401, 'Unauthorized');
+    }
+    return handleConvertThread(req, res, requestId);
   }
 
   res.writeHead(404);
@@ -235,6 +243,122 @@ async function handleConvert(req, res, requestId) {
         res.setHeader('X-Queue-Limit-MB', String(MAX_QUEUED_EML_MB));
         res.setHeader('X-Queued-Bytes', String(queuedBytes));
         res.setHeader('X-In-Flight-Renders', String(inFlight));
+      }
+      jsonError(res, status, clientMsg);
+    }
+  } finally {
+    if (acquired) release();
+  }
+}
+
+async function handleConvertThread(req, res, requestId) {
+  const started = Date.now();
+  let acquired = false;
+
+  try {
+    const body = await readJsonBody(req, MAX_REQUEST_BYTES);
+
+    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+      return jsonError(res, 400, 'messages array must not be empty');
+    }
+
+    // Validate each message has raw payload
+    for (let i = 0; i < body.messages.length; i++) {
+      const msg = body.messages[i];
+      if (!msg.rawBase64Url && !msg.emlBase64) {
+        return jsonError(res, 400, `messages[${i}] must have rawBase64Url or emlBase64`);
+      }
+    }
+
+    const options = body.options || {};
+
+    // outputs validation
+    const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
+    let requestedOutputs = ['pdf', 'markdown']; // default for thread: both
+    if (options.outputs !== undefined) {
+      if (!Array.isArray(options.outputs)) {
+        return jsonError(res, 400, 'options.outputs must be an array of strings');
+      }
+      if (options.outputs.length === 0) {
+        return jsonError(res, 400, 'options.outputs cannot be empty');
+      }
+      const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
+      for (const o of normalized) {
+        if (!ALLOWED_OUTPUTS.has(o)) {
+          return jsonError(res, 400, `Invalid output format "${o}". Allowed: pdf, markdown`);
+        }
+      }
+      requestedOutputs = normalized;
+    }
+
+    // quoteMode validation
+    const quoteMode = options.quoteMode === 'strip' ? 'strip' : 'preserve';
+
+    const clientWantsRemote = options.loadRemoteImages !== false;
+    const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
+    const remoteDisabledReason = loadRemoteImages
+      ? null
+      : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
+
+    const opts = {
+      threadId: body.threadId || undefined,
+      timezone: typeof options.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
+      outputs: requestedOutputs,
+      quoteMode,
+      widthPx: clamp(options.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
+      maxHeightPx: clamp(options.maxHeightPx, HEIGHT_MIN, HEIGHT_MAX, DEFAULT_MAX_HEIGHT_PX * 2),
+      loadRemoteImages,
+      remoteDisabledReason,
+      timeout: clamp(options.timeout, TIMEOUT_MIN, TIMEOUT_MAX * 2, CONVERSION_TIMEOUT_MS * 2),
+    };
+
+    const needsRenderSlot = requestedOutputs.includes('pdf');
+
+    // Calculate total payload bytes for queue accounting
+    const totalBytes = body.messages.reduce((sum, m) => {
+      const raw = m.rawBase64Url || m.emlBase64 || '';
+      return sum + Math.ceil(raw.length * 0.75); // approx decoded size
+    }, 0);
+
+    if (needsRenderSlot) {
+      await acquire(totalBytes);
+      acquired = true;
+    }
+
+    const result = await convertThread(body.messages, opts);
+
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': 'attachment; filename="thread-result.zip"',
+    });
+    res.end(result.zipBuffer);
+
+    console.log(JSON.stringify({
+      level: 'info',
+      requestId,
+      endpoint: 'convert-thread',
+      durationMs: Date.now() - started,
+      messageCount: body.messages.length,
+      zipBytes: result.zipBuffer?.length || 0,
+      attachments: result.metadata?.attachments?.length || 0,
+      quoteMode,
+      outputs: requestedOutputs,
+    }));
+  } catch (err) {
+    const status = err.status || 500;
+    const isBackpressure = status === 503 && err.retryAfter;
+    const clientMsg = (status >= 500 && !isBackpressure) ? 'Internal error' : err.message;
+    console.error(JSON.stringify({
+      level: 'error',
+      requestId,
+      endpoint: 'convert-thread',
+      durationMs: Date.now() - started,
+      status,
+      error: err.message,
+    }));
+    if (!res.headersSent) {
+      if (err.retryAfter) {
+        res.setHeader('Retry-After', String(err.retryAfter));
       }
       jsonError(res, status, clientMsg);
     }

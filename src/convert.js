@@ -308,7 +308,20 @@ function normalizeCid(value = '') {
   return cid;
 }
 
-export { buildHtml as buildHtmlForTest, filterRemoteUrls as filterRemoteUrlsForTest };
+export {
+  buildHtml as buildHtmlForTest,
+  filterRemoteUrls as filterRemoteUrlsForTest,
+  EMAIL_ALLOWED_TAGS,
+  EMAIL_ALLOWED_ATTRS,
+  stripPaginationCss,
+  normalizeCid,
+  bufferToDataUrl,
+  formatBaseName,
+  formatDisplayDate,
+  extractAttachments,
+  escapeHtml,
+  sanitizeFilename,
+};
 
 function buildHtml(mail, timezone = 'UTC', warnings = []) {
   const attachments = mail.attachments || [];
@@ -695,7 +708,7 @@ async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
   return out;
 }
 
-async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings }) {
+export async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings }) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     javaScriptEnabled: false, // emails don't need JS — kills a whole class of risk
