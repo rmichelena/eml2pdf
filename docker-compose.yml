@@ -4,13 +4,38 @@ services:
     container_name: eml2pdf
     restart: unless-stopped
     ports:
-      - "3005:3000"
+      # Bind to loopback by default — front it with a reverse proxy / n8n on the same network.
+      - "127.0.0.1:3005:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
       - MAX_REQUEST_MB=50
       - DEFAULT_WIDTH_PX=900
       - DEFAULT_MAX_HEIGHT_PX=30000
-      - LOAD_REMOTE_IMAGES=false
+      # Remote images on by default for fidelity with marketing/signature
+      # emails. SSRF risk is REDUCED — not eliminated — by two layers:
+      #   (1) http(s) URLs to private/loopback/IMDS hosts are stripped from
+      #       the rendered body statically (DNS-resolved hostnames checked).
+      #   (2) Chromium's runtime fetch path (PDF only) is gated by the same
+      #       filter via context.route.
+      # Residual risks: a DNS-rebinding window between the resolver we
+      # consult and Chromium's own resolver, and exfiltration via DNS lookups
+      # themselves. For a stricter posture, set this to false (no public-
+      # internet fetches at all from the renderer) and/or front the service
+      # with an outbound proxy that filters destinations.
+      - LOAD_REMOTE_IMAGES=true
       - DEFAULT_TIMEZONE=UTC
+      - MAX_CONCURRENT_RENDERS=5
+      - MAX_QUEUED_EML_MB=500
+      - MAX_QUEUE_WAIT_MS=180000
+      # - API_KEY=change-me   # uncomment to require X-API-Key header
     shm_size: "1gb"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
