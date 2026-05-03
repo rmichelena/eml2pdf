@@ -16,6 +16,7 @@ const MAX_CONCURRENT_RENDERS = parseInt(process.env.MAX_CONCURRENT_RENDERS || '5
 const MAX_QUEUED_EML_MB = parseInt(process.env.MAX_QUEUED_EML_MB || '500', 10);
 const MAX_QUEUED_EML_BYTES = MAX_QUEUED_EML_MB * 1024 * 1024;
 const MAX_QUEUE_WAIT_MS = parseInt(process.env.MAX_QUEUE_WAIT_MS || '180000', 10);
+const MAX_THREAD_MESSAGES = parseInt(process.env.MAX_THREAD_MESSAGES || '200', 10);
 const API_KEY = process.env.API_KEY || '';
 
 // Bounds for client-supplied options (DoS protection)
@@ -260,6 +261,10 @@ async function handleConvertThread(req, res, requestId) {
 
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
       return jsonError(res, 400, 'messages array must not be empty');
+    }
+
+    if (body.messages.length > MAX_THREAD_MESSAGES) {
+      return jsonError(res, 413, `Too many messages (${body.messages.length}). Limit: ${MAX_THREAD_MESSAGES}`);
     }
 
     // Validate each message has raw payload

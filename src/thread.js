@@ -215,11 +215,27 @@ function buildThreadHtml(messages, timezone) {
 </div>`);
   }
 
+  // P4 fix: CSP defense-in-depth, same as convert.js wrapForPdf
+  const csp = [
+    "default-src 'none'",
+    "img-src http: https: data: cid:",
+    "style-src 'unsafe-inline' http: https:",
+    "font-src http: https: data:",
+    "media-src http: https: data:",
+    "script-src 'none'",
+    "frame-src 'none'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join('; ');
+
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
 <style>
+  @page { size: auto; margin: 0 }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; }
   img { max-width: 100%; height: auto; }
   table { border-collapse: collapse; }
@@ -289,7 +305,8 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
 
   const subject = mdEscapeInline(threadMeta.subject || 'Email Thread');
   lines.push(`# ${subject}`);
-  lines.push(`> ${messages.length} message${messages.length !== 1 ? 's' : ''} · ${(threadMeta.participants || []).join(', ')}`);
+  const escapedParticipants = (threadMeta.participants || []).map(p => mdEscapeInline(p));
+  lines.push(`> ${messages.length} message${messages.length !== 1 ? 's' : ''} · ${escapedParticipants.join(', ')}`);
   lines.push('');
 
   for (let i = 0; i < messages.length; i++) {
@@ -300,9 +317,9 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
     lines.push('');
     lines.push(`## Message ${i + 1}`);
     lines.push('');
-    lines.push(`**From:** ${msg.from} · **Date:** ${dateStr}`);
-    if (msg.to.length) lines.push(`**To:** ${msg.to.join(', ')}`);
-    if (msg.cc.length) lines.push(`**Cc:** ${msg.cc.join(', ')}`);
+    lines.push(`**From:** ${mdEscapeInline(msg.from)} · **Date:** ${dateStr}`);
+    if (msg.to.length) lines.push(`**To:** ${msg.to.map(mdEscapeInline).join(', ')}`);
+    if (msg.cc.length) lines.push(`**Cc:** ${msg.cc.map(mdEscapeInline).join(', ')}`);
     lines.push('');
 
     // Use HTML if available, fall back to escaped text
@@ -398,11 +415,24 @@ export async function convertThread(rawMessages, opts = {}) {
     let emlBuf;
 
     if (raw.emlBase64) {
+      // P2 fix: strict base64 validation
       const trimmed = String(raw.emlBase64).replace(/\s+/g, '');
+      if (!/^[A-Za-z0-9+/]*=*$/.test(trimmed)) {
+        throw Object.assign(new Error(`messages[${i}] has invalid emlBase64`), { status: 400 });
+      }
       emlBuf = Buffer.from(trimmed, 'base64');
+      if (emlBuf.length === 0) {
+        throw Object.assign(new Error(`messages[${i}] has empty emlBase64`), { status: 400 });
+      }
     } else if (raw.rawBase64Url) {
       const normalized = String(raw.rawBase64Url).replace(/-/g, '+').replace(/_/g, '/');
+      if (!/^[A-Za-z0-9+/]*=*$/.test(normalized)) {
+        throw Object.assign(new Error(`messages[${i}] has invalid rawBase64Url`), { status: 400 });
+      }
       emlBuf = Buffer.from(normalized, 'base64');
+      if (emlBuf.length === 0) {
+        throw Object.assign(new Error(`messages[${i}] has empty rawBase64Url`), { status: 400 });
+      }
     } else {
       throw Object.assign(
         new Error(`messages[${i}] must have rawBase64Url or emlBase64`),
@@ -428,7 +458,16 @@ export async function convertThread(rawMessages, opts = {}) {
     // Apply remote URL policy
     processedBody = await filterRemoteUrls(processedBody, { loadRemoteImages, warnings });
 
-    const date = raw.internalDate ? new Date(raw.internalDate) : (mail.date || new Date());
+    // P1 fix: Gmail returns internalDate as epoch-ms string (e.g. "1745856000000").
+    // Must parse as Number; new Date(string) only handles ISO date strings.
+    let date;
+    if (raw.internalDate != null) {
+      const ms = Number(raw.internalDate);
+      date = Number.isFinite(ms) ? new Date(ms) : null;
+    }
+    if (!date || !Number.isFinite(date.getTime())) {
+      date = mail.date || new Date();
+    }
     const subject = mail.subject || '';
     const from = mail.from?.text || '';
     const to = (mail.to?.value || []).map(a => a.text || a.address);
