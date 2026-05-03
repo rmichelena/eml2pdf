@@ -54,7 +54,15 @@ const QUOTE_SEPARATOR_RE =
 export function stripQuotesHtml(html) {
   if (!html) return html;
 
-  // Phase 1: Remove known quote containers via regex (these are well-bounded)
+  // Phase 1: Remove known quote containers via regex.
+  //
+  // NOTE on greedy matching: the greedy [\s\S]* regex can over-strip when
+  // two independent gmail_quote blockquotes exist separated by legitimate
+  // content. This is a known trade-off — the correct fix would use DOM-aware
+  // parsing (cheerio/sanitize-html transformTags) to handle nested and
+  // parallel blockquotes. For now, greedy is chosen because nested quotes
+  // (the more common case) require it, and parallel independent gmail_quotes
+  // in the same email body is rare.
   let result = html;
 
   // Remove blockquote.gmail_quote (greedy to catch nested content)
@@ -81,20 +89,27 @@ export function stripQuotesHtml(html) {
   // We find the first quote-separator text in the HTML and cut everything from
   // the start of its enclosing block tag onwards.
   const separatorPatterns = [
-    /On .+ (wrote|eschrieben|escribió|ha escrito):/i,
-    /El .+ escribió:/i,
-    /-{3,}\s*Original Message\s*-{3,}/i,
+    /On .+ wrote:/i,                          // English
+    /El .+ escribió:/i,                       // Spanish
+    /Le .+ a écrit\s*:/i,                     // French
+    /Am .+ schrieb .+:/i,                     // German (covers "eschrieben"/"geschrieben")
+    /.+ ha scritto:/i,                        // Italian
+    /.+ escreveu:/i,                          // Portuguese
+    /-{3,}\s*Original Message\s*-{3,}/i,      // Outlook EN
+    /-{3,}\s*Mensaje original\s*-{3,}/i,      // Outlook ES
   ];
 
   for (const pat of separatorPatterns) {
-    // Find the separator in plain text
-    const plainText = result.replace(/<[^>]+>/g, ' ');
+    // Find the separator in plain text (strip tags completely for alignment)
+    const plainText = result.replace(/<[^>]+>/g, '');
     const m = plainText.match(pat);
     if (!m || m.index > plainText.length * 0.5) continue;
 
-    // Walk the HTML tracking text position, remembering last block-tag opening
+    // Walk the HTML tracking text position, remembering last block-tag opening.
+    // Both plainText and the walk strip tags completely (no space), so
+    // textIdx stays aligned with m.index.
     let htmlIdx = 0, textIdx = 0, lastBlockOpen = -1;
-    while (htmlIdx < result.length && textIdx < m.index) {
+    while (htmlIdx < result.length) {
       if (result[htmlIdx] === '<') {
         const rest = result.slice(htmlIdx);
         if (/^<(div|p|blockquote|section|article|aside|header|footer|main)\b[^>]*>/i.test(rest)) {
@@ -104,6 +119,8 @@ export function stripQuotesHtml(html) {
         if (closeBracket === -1) break;
         htmlIdx = closeBracket + 1;
       } else {
+        // Check if we've reached or passed the separator position
+        if (textIdx >= m.index) break;
         textIdx++;
         htmlIdx++;
       }
