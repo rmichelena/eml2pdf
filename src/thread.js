@@ -109,31 +109,82 @@ export function stripQuotesText(text) {
 
 // ─── Attachment deduplication ─────────────────────────────────────────
 
+function formatDateSuffix(date, timezone) {
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(d);
+    const get = (type) => parts.find(p => p.type === type)?.value || '00';
+    return `${get('year')}-${get('month')}-${get('day')}_${get('hour')}-${get('minute')}`;
+  } catch {
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}_${pad(d.getUTCHours())}-${pad(d.getUTCMinutes())}`;
+  }
+}
+
 /**
  * Deduplicate attachments by filename across all messages.
- * First occurrence wins; subsequent same-named files get a suffix.
+ *
+ * When the same filename appears multiple times (e.g. revised versions of
+ * a document), the OLDEST occurrence gets a date-stamped suffix and the
+ * NEWEST (last) keeps the original name. This matches the expectation that
+ * the latest revision is the canonical one.
+ *
+ * Example with 3 messages carrying "presentation.pdf":
+ *   presentation.pdf                       (newest, keeps original name)
+ *   presentation_2025-11-22_15-20.pdf      (older, date-stamped)
+ *   presentation_2025-11-21_18-01.pdf      (oldest, date-stamped)
  */
 function dedupAttachments(allAttachments) {
-  const seen = new Map();
-  const result = [];
+  // Group attachments by original filename, preserving order
+  const groups = new Map(); // filename → [{ att, msgDate, index }]
 
-  for (const att of allAttachments) {
-    let name = att.filename;
-    if (seen.has(name)) {
-      const count = seen.get(name) + 1;
-      seen.set(name, count);
-      const dot = name.lastIndexOf('.');
-      const ext = dot > 0 ? name.slice(dot) : '';
-      const base = dot > 0 ? name.slice(0, dot) : name;
-      name = `${base}_${count}${ext}`;
-    } else {
-      seen.set(name, 1);
-    }
-    att.filename = name;
-    result.push(att);
+  for (let i = 0; i < allAttachments.length; i++) {
+    const att = allAttachments[i];
+    const name = att.filename;
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push({ att, index: i });
   }
 
-  return result;
+  const result = new Array(allAttachments.length).fill(null);
+
+  for (const [, entries] of groups) {
+    if (entries.length === 1) {
+      // No conflict — keep as-is
+      result[entries[0].index] = entries[0].att;
+      continue;
+    }
+
+    // Sort by message date ascending (oldest first)
+    // The att.msgDate was set in convertThread before calling dedupAttachments
+    entries.sort((a, b) => {
+      const da = a.att._msgDate || 0;
+      const db = b.att._msgDate || 0;
+      return da - db;
+    });
+
+    // Oldest entries get date-stamped names; the last (newest) keeps the original
+    for (let j = 0; j < entries.length; j++) {
+      const { att, index } = entries[j];
+      if (j < entries.length - 1) {
+        // Rename with date suffix
+        const dot = att.filename.lastIndexOf('.');
+        const ext = dot > 0 ? att.filename.slice(dot) : '';
+        const base = dot > 0 ? att.filename.slice(0, dot) : att.filename;
+        const dateSuffix = att._msgDateStr || String(j + 1);
+        att.filename = `${base}_${dateSuffix}${ext}`;
+      }
+      // newest entry keeps original filename
+      delete att._msgDate;
+      delete att._msgDateStr;
+      result[index] = att;
+    }
+  }
+
+  return result.filter(Boolean);
 }
 
 // ─── Thread HTML builder (for PDF) ────────────────────────────────────
@@ -384,6 +435,11 @@ export async function convertThread(rawMessages, opts = {}) {
     const cc = (mail.cc?.value || []).map(a => a.text || a.address);
 
     const msgAttachments = extractAttachments(mail, usedCids);
+    // Tag each attachment with the message date for dedup renaming
+    for (const att of msgAttachments) {
+      att._msgDate = date.getTime();
+      att._msgDateStr = formatDateSuffix(date, timezone);
+    }
     allAttachments.push(...msgAttachments);
 
     parsedMessages.push({
