@@ -255,6 +255,39 @@ function extractMd(buf) {
   }
 }
 
+// 15. Parallel gmail_quote blocks do not delete legitimate content between them
+{
+  const msg = buildEml({
+    from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Parallel quotes',
+    date: 'Mon, 28 Apr 2025 10:00:00 +0200',
+    body: '<p>Reply start</p><blockquote class="gmail_quote"><p>old one</p></blockquote><p>Legitimate middle content</p><blockquote class="gmail_quote"><p>old two</p></blockquote><p>Reply end</p>',
+  });
+
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'], quoteMode: 'strip' },
+  });
+  assertEqual(res.status, 200, 'parallel gmail_quote: 200');
+  if (res.ok) {
+    const md = extractMd(Buffer.from(await res.arrayBuffer()));
+    assert(md.includes('Reply start'), 'parallel gmail_quote: start preserved');
+    assert(md.includes('Legitimate middle content'), 'parallel gmail_quote: middle preserved');
+    assert(md.includes('Reply end'), 'parallel gmail_quote: end preserved');
+    assert(!md.includes('old one'), 'parallel gmail_quote: first quote removed');
+    assert(!md.includes('old two'), 'parallel gmail_quote: second quote removed');
+  }
+}
+
+// 16. Invalid quoteMode returns 400 instead of silently preserving quotes
+{
+  const msg = buildEml({ from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Bad mode', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: '<p>Hi</p>' });
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'], quoteMode: 'strp' },
+  });
+  assertEqual(res.status, 400, 'invalid quoteMode: 400');
+}
+
 console.log(`\n${'='.repeat(40)}`);
 console.log(`Tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

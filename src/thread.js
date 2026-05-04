@@ -14,6 +14,7 @@
 
 import { simpleParser } from 'mailparser';
 import archiver from 'archiver';
+import sanitizeHtml from 'sanitize-html';
 import { getTurndownService, mdEscapeInline, formatBytes, formatTimestampStem, formatDateSuffix } from './textutil.js';
 
 import {
@@ -48,34 +49,27 @@ const QUOTE_SEPARATOR_RE =
 export function stripQuotesHtml(html) {
   if (!html) return html;
 
-  // Phase 1: Remove known quote containers via regex.
-  //
-  // NOTE on greedy matching: the greedy [\s\S]* regex can over-strip when
-  // two independent gmail_quote blockquotes exist separated by legitimate
-  // content. This is a known trade-off — the correct fix would use DOM-aware
-  // parsing (cheerio/sanitize-html transformTags) to handle nested and
-  // parallel blockquotes. For now, greedy is chosen because nested quotes
-  // (the more common case) require it, and parallel independent gmail_quotes
-  // in the same email body is rare.
+  // Phase 1: Remove known quote containers.
   let result = html;
 
-  // Remove blockquote.gmail_quote (greedy to catch nested content)
-  result = result.replace(
-    /<blockquote[^>]*class=["'][^"']*gmail_quote[^"']*["'][^>]*>[\s\S]*<\/blockquote>/gi,
-    ''
-  );
-
-  // Remove div.gmail_quote and contents
-  result = result.replace(
-    /<div[^>]*class=["'][^"']*gmail_quote[^"']*["'][^>]*>[\s\S]*<\/div>/gi,
-    ''
-  );
-
-  // Remove blockquote[type="cite"] and contents
-  result = result.replace(
-    /<blockquote[^>]*type=["']cite["'][^>]*>[\s\S]*<\/blockquote>/gi,
-    ''
-  );
+  // Remove known quote containers with an HTML parser instead of greedy regex.
+  // Regex can over-strip content between two independent gmail_quote blocks;
+  // sanitize-html's exclusiveFilter removes the matched element and its
+  // descendants while preserving legitimate siblings between quote blocks.
+  result = sanitizeHtml(result, {
+    allowedTags: false,
+    allowedAttributes: false,
+    allowVulnerableTags: true,
+    exclusiveFilter(frame) {
+      const tag = String(frame.tag || '').toLowerCase();
+      const cls = String(frame.attribs?.class || '');
+      const type = String(frame.attribs?.type || '');
+      return (
+        ((tag === 'blockquote' || tag === 'div') && /\bgmail_quote\b/i.test(cls)) ||
+        (tag === 'blockquote' && type.toLowerCase() === 'cite')
+      );
+    },
+  });
 
   // Phase 2: Outlook/Apple Mail pattern stripping.
   // These clients don't wrap quotes in blockquotes — they use plain <div>/<p>:
@@ -384,7 +378,7 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
     lines.push('');
     lines.push('## Conversion warnings');
     lines.push('');
-    for (const w of threadMeta.warnings) lines.push(`- ${w}`);
+    for (const w of threadMeta.warnings) lines.push(`- ${mdEscapeInline(w)}`);
   }
 
   return lines.join('\n') + '\n';

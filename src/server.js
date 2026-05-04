@@ -297,7 +297,13 @@ async function handleConvertThread(req, res, requestId) {
     }
 
     // quoteMode validation
-    const quoteMode = options.quoteMode === 'strip' ? 'strip' : 'preserve';
+    let quoteMode = 'preserve';
+    if (options.quoteMode !== undefined) {
+      quoteMode = String(options.quoteMode).toLowerCase();
+      if (quoteMode !== 'strip' && quoteMode !== 'preserve') {
+        return jsonError(res, 400, 'options.quoteMode must be "strip" or "preserve"');
+      }
+    }
 
     const clientWantsRemote = options.loadRemoteImages !== false;
     const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
