@@ -288,6 +288,23 @@ function extractMd(buf) {
   assertEqual(res.status, 400, 'invalid quoteMode: 400');
 }
 
+// 17. Residual layout-table HTML in signatures is degraded to readable Markdown text
+{
+  const signature = '<table border="0"><tbody><tr><td><img><br></td><td><table><tbody><tr><td><span id="name">Roberto Michelena</span><span>&nbsp;|&nbsp;</span><span>Gerente General</span><br><span>CONSORCIO INFINITEK-GOALS</span><br><span>Cel +51 992784344</span></td></tr><tr><td><a href="mailto:roberto@infinitek.pe">email</a><span>&nbsp;|&nbsp;</span><a href="https://wa.me/51992784344">whatsapp</a></td></tr></tbody></table></td></tr></tbody></table>';
+  const msg = buildEml({ from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Signature', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: `<p>Saludos,</p>${signature}` });
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'], quoteMode: 'strip' },
+  });
+  assertEqual(res.status, 200, 'signature table markdown: 200');
+  if (res.ok) {
+    const md = extractMd(Buffer.from(await res.arrayBuffer()));
+    assert(md.includes('Roberto Michelena'), 'signature table markdown: text preserved');
+    assert(md.includes('mailto:roberto@infinitek.pe'), 'signature table markdown: link preserved');
+    assert(!/<table|<tbody|<tr|<td|<span/i.test(md), 'signature table markdown: no raw layout HTML');
+  }
+}
+
 console.log(`\n${'='.repeat(40)}`);
 console.log(`Tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

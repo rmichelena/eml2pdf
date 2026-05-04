@@ -406,7 +406,6 @@ function readJsonBody(req, maxBytes) {
     const safeReject = (e) => {
       if (settled) return;
       settled = true;
-      try { req.destroy(); } catch { /* ignore */ }
       reject(e);
     };
     const safeResolve = (v) => {

@@ -1,4 +1,4 @@
-import { getTurndownService, mdEscapeInline, formatBytes } from './textutil.js';
+import { getTurndownService, mdEscapeInline, formatBytes, normalizeResidualHtml } from './textutil.js';
 
 let _service = null;
 
@@ -38,7 +38,7 @@ export function buildMarkdown(mail, bodyWithImages, metadata) {
   lines.push(`# ${subject || 'Email'}`);
   lines.push('');
 
-  const bodyMd = td.turndown(bodyWithImages || '').trim();
+  const bodyMd = normalizeResidualHtml(td.turndown(bodyWithImages || '').trim());
   lines.push(bodyMd);
 
   if (metadata.attachments?.length) {

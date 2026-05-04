@@ -15,7 +15,7 @@
 import { simpleParser } from 'mailparser';
 import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
-import { getTurndownService, mdEscapeInline, formatBytes, formatTimestampStem, formatDateSuffix } from './textutil.js';
+import { getTurndownService, mdEscapeInline, formatBytes, formatTimestampStem, formatDateSuffix, normalizeResidualHtml } from './textutil.js';
 
 import {
   buildHtmlForTest as buildSingleHtml,
@@ -23,6 +23,7 @@ import {
   EMAIL_RENDER_CSP,
   formatDisplayDate,
   extractAttachments,
+  attachmentListHtml,
   escapeHtml,
   sanitizeFilename,
   renderPdf,
@@ -176,29 +177,45 @@ export function stripQuotesText(text) {
 // ─── Attachment deduplication ─────────────────────────────────────────
 
 /**
- * Deduplicate attachments by filename across all messages.
+ * Deduplicate attachments by content hash first, then version by filename.
  *
- * When the same filename appears multiple times (e.g. revised versions of
- * a document), the OLDEST occurrence gets a date-stamped suffix and the
- * NEWEST (last) keeps the original name. This matches the expectation that
- * the latest revision is the canonical one.
- *
- * Example with 3 messages carrying "presentation.pdf":
- *   presentation.pdf                       (newest, keeps original name)
- *   presentation_2025-11-22_15-20.pdf      (older, date-stamped)
- *   presentation_2025-11-21_18-01.pdf      (oldest, date-stamped)
+ * Exact duplicate content (same sha256, common in forwards/replies) is emitted
+ * once and every message points at the canonical filename. Different content
+ * with the same filename is treated as revisions: newest keeps the original
+ * name, older revisions get date-stamped suffixes.
  */
 function dedupAttachments(allAttachments) {
-  // Group attachments by original filename, preserving order
-  const groups = new Map(); // filename → [{ att, index }]
-
+  const byHash = new Map();
   for (let i = 0; i < allAttachments.length; i++) {
     const att = allAttachments[i];
-    if (!groups.has(att.filename)) groups.set(att.filename, []);
-    groups.get(att.filename).push({ att, index: i });
+    const key = att.sha256 || `${att.filename}:${att.size}:${i}`;
+    if (!byHash.has(key)) byHash.set(key, []);
+    byHash.get(key).push({ att, index: i });
   }
 
-  const result = new Array(allAttachments.length).fill(null);
+  const representatives = [];
+  for (const [, entries] of byHash) {
+    entries.sort((a, b) => (a.att._msgDate || 0) - (b.att._msgDate || 0));
+    const canonical = entries[entries.length - 1].att; // newest message wins naming/version semantics
+    for (const { att } of entries) {
+      if (att !== canonical) {
+        att._duplicateOfSha256 = canonical.sha256 || att.sha256;
+        att.filename = canonical.filename;
+      }
+    }
+    representatives.push({ att: canonical, entries });
+  }
+
+  // Group unique-content representatives by original filename.
+  const groups = new Map(); // filename → [{ rep, index }]
+  for (let i = 0; i < representatives.length; i++) {
+    const rep = representatives[i];
+    const filename = rep.att.filename;
+    if (!groups.has(filename)) groups.set(filename, []);
+    groups.get(filename).push({ rep, index: i });
+  }
+
+  const result = new Array(representatives.length).fill(null);
   // Track all emitted filenames to guarantee global uniqueness.
   // This catches collisions where a date-stamped name accidentally
   // matches an unrelated original filename.
@@ -222,39 +239,46 @@ function dedupAttachments(allAttachments) {
 
   for (const [, entries] of groups) {
     if (entries.length === 1) {
-      const att = entries[0].att;
-      att.filename = uniqueName(att.filename);
-      delete att._msgDate;
-      delete att._msgDateStr;
+      const att = entries[0].rep.att;
+      const finalName = uniqueName(att.filename);
+      for (const { att: linked } of entries[0].rep.entries) linked.filename = finalName;
+      cleanupDedupFields(att);
       result[entries[0].index] = att;
       continue;
     }
 
     // Sort by message date ascending (oldest first)
-    entries.sort((a, b) => (a.att._msgDate || 0) - (b.att._msgDate || 0));
+    entries.sort((a, b) => (a.rep.att._msgDate || 0) - (b.rep.att._msgDate || 0));
 
     // Process oldest first — they get date-stamped names.
     // The newest (last) keeps the original name.
     for (let j = 0; j < entries.length; j++) {
-      const att = entries[j].att;
+      const att = entries[j].rep.att;
+      let finalName;
       if (j < entries.length - 1) {
         // Rename with date suffix
         const dot = att.filename.lastIndexOf('.');
         const ext = dot > 0 ? att.filename.slice(dot) : '';
         const base = dot > 0 ? att.filename.slice(0, dot) : att.filename;
         const dateSuffix = att._msgDateStr || String(j + 1);
-        att.filename = uniqueName(`${base}_${dateSuffix}${ext}`);
+        finalName = uniqueName(`${base}_${dateSuffix}${ext}`);
       } else {
         // Newest keeps original name (but still dedup-checked)
-        att.filename = uniqueName(att.filename);
+        finalName = uniqueName(att.filename);
       }
-      delete att._msgDate;
-      delete att._msgDateStr;
+      for (const { att: linked } of entries[j].rep.entries) linked.filename = finalName;
+      cleanupDedupFields(att);
       result[entries[j].index] = att;
     }
   }
 
   return result.filter(Boolean);
+}
+
+function cleanupDedupFields(att) {
+  delete att._msgDate;
+  delete att._msgDateStr;
+  delete att._duplicateOfSha256;
 }
 
 // ─── Thread HTML builder (for PDF) ────────────────────────────────────
@@ -281,6 +305,7 @@ function buildThreadHtml(messages, timezone) {
   </div>
   <div style="padding: 0 10px;">
     ${msg.html}
+    ${attachmentListHtml(msg.attachments)}
   </div>
 </div>`);
   }
@@ -350,7 +375,7 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
     lines.push('');
 
     // Use HTML if available, fall back to escaped text
-    const bodyMd = td.turndown(msg.html || `<p>${escapeHtml(msg.text || '')}</p>`).trim();
+    const bodyMd = normalizeResidualHtml(td.turndown(msg.html || `<p>${escapeHtml(msg.text || '')}</p>`).trim());
     lines.push(bodyMd);
 
     if (msg.attachments.length) {
@@ -539,12 +564,14 @@ export async function convertThread(rawMessages, opts = {}) {
         filename: a.filename,
         contentType: a.contentType,
         size: a.size,
+        sha256: a.sha256,
       })),
     })),
     attachments: finalAttachments.map(a => ({
       filename: a.filename,
       contentType: a.contentType,
       size: a.size,
+      sha256: a.sha256,
     })),
     outputs,
     warnings,

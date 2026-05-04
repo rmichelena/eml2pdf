@@ -5,11 +5,11 @@ services:
     restart: unless-stopped
     ports:
       # Bind to loopback by default — front it with a reverse proxy / n8n on the same network.
-      - "127.0.0.1:3005:3000"
+      - "3005:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - MAX_REQUEST_MB=50
+      - MAX_REQUEST_MB=200
       - DEFAULT_WIDTH_PX=900
       - DEFAULT_MAX_HEIGHT_PX=30000
       # Remote images on by default for fidelity with marketing/signature
@@ -24,6 +24,8 @@ services:
       # internet fetches at all from the renderer) and/or front the service
       # with an outbound proxy that filters destinations.
       - LOAD_REMOTE_IMAGES=true
+      - REMOTE_RESOURCE_CACHE_MB=100
+      - REMOTE_RESOURCE_CACHE_TTL_MS=86400000
       - DEFAULT_TIMEZONE=UTC
       - MAX_CONCURRENT_RENDERS=5
       - MAX_QUEUED_EML_MB=500

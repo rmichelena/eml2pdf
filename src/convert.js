@@ -2,6 +2,7 @@ import { simpleParser } from 'mailparser';
 import { chromium } from 'playwright';
 import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
+import { createHash } from 'crypto';
 import { isPrivateHost } from './netfilter.js';
 import { buildMarkdown } from './markdown.js';
 import { formatTimestampStem } from './textutil.js';
@@ -112,6 +113,85 @@ const LAUNCH_ARGS = [
   '--disable-sync',
   '--no-first-run',
 ];
+
+const REMOTE_CACHE_MAX_BYTES = Math.max(0, parseInt(process.env.REMOTE_RESOURCE_CACHE_MB || '100', 10)) * 1024 * 1024;
+const REMOTE_CACHE_TTL_MS = Math.max(0, parseInt(process.env.REMOTE_RESOURCE_CACHE_TTL_MS || String(24 * 60 * 60 * 1000), 10));
+const remoteResourceCache = new Map(); // url → { status, headers, body, bytes, expiresAt, lastUsed }
+let remoteResourceCacheBytes = 0;
+
+function cacheableResponse(headers = {}) {
+  const cc = String(headers['cache-control'] || '').toLowerCase();
+  if (cc.includes('no-store') || cc.includes('private')) return false;
+  const ct = String(headers['content-type'] || '').toLowerCase();
+  return /^(image|font)\//.test(ct) || ct.includes('text/css');
+}
+
+function fulfillHeaders(headers = {}, bodyLength = null) {
+  const out = { ...headers };
+  // Playwright's APIResponse.body() is the bytes we will fulfill with. Do not
+  // replay transport/framing/compression headers from the upstream response:
+  // if the body has already been decoded but `content-encoding: gzip/br` is
+  // preserved, Chromium can try to decode it again and intermittently fail to
+  // render cached signature images.
+  for (const k of Object.keys(out)) {
+    const lower = k.toLowerCase();
+    if (
+      lower === 'content-encoding' ||
+      lower === 'content-length' ||
+      lower === 'transfer-encoding' ||
+      lower === 'connection' ||
+      lower === 'keep-alive'
+    ) {
+      delete out[k];
+    }
+  }
+  if (bodyLength != null) out['content-length'] = String(bodyLength);
+  return out;
+}
+
+function getCachedRemote(url) {
+  if (REMOTE_CACHE_MAX_BYTES <= 0) return null;
+  const entry = remoteResourceCache.get(url);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    remoteResourceCache.delete(url);
+    remoteResourceCacheBytes -= entry.bytes;
+    return null;
+  }
+  entry.lastUsed = Date.now();
+  return entry;
+}
+
+function putCachedRemote(url, entry) {
+  if (REMOTE_CACHE_MAX_BYTES <= 0 || REMOTE_CACHE_TTL_MS <= 0) return;
+  if (entry.status !== 200) return;
+  if (!cacheableResponse(entry.headers) || entry.body.length > REMOTE_CACHE_MAX_BYTES) return;
+  const prev = remoteResourceCache.get(url);
+  if (prev) remoteResourceCacheBytes -= prev.bytes;
+
+  const cached = {
+    ...entry,
+    bytes: entry.body.length,
+    expiresAt: Date.now() + REMOTE_CACHE_TTL_MS,
+    lastUsed: Date.now(),
+  };
+  remoteResourceCache.set(url, cached);
+  remoteResourceCacheBytes += cached.bytes;
+
+  while (remoteResourceCacheBytes > REMOTE_CACHE_MAX_BYTES && remoteResourceCache.size > 0) {
+    let oldestUrl = null;
+    let oldestUsed = Infinity;
+    for (const [u, e] of remoteResourceCache) {
+      if (e.lastUsed < oldestUsed) {
+        oldestUsed = e.lastUsed;
+        oldestUrl = u;
+      }
+    }
+    const old = remoteResourceCache.get(oldestUrl);
+    remoteResourceCache.delete(oldestUrl);
+    remoteResourceCacheBytes -= old.bytes;
+  }
+}
 
 function getBrowser() {
   if (_browserPromise) {
@@ -236,15 +316,14 @@ export async function convertEmail(emlBuf, opts = {}) {
   // as defense in depth (catches anything our static analysis missed, e.g.
   // URLs inside @font-face rules).
   const filteredBody = await filterRemoteUrls(bodyRaw, { loadRemoteImages, warnings });
+  const attachments = extractAttachments(mail, usedCids);
 
   // PDF is the only path that touches Chromium — skip entirely when not asked.
   const pdfBuffer = wantPdf
-    ? await renderPdf(wrapForPdf(filteredBody, mail, timezone), {
+    ? await renderPdf(wrapForPdf(filteredBody, mail, timezone, attachments), {
         widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings,
       })
     : null;
-
-  const attachments = extractAttachments(mail, usedCids);
 
   const metadata = {
     messageId: messageId || mail.messageId || undefined,
@@ -259,6 +338,7 @@ export async function convertEmail(emlBuf, opts = {}) {
       filename: a.filename,
       contentType: a.contentType,
       size: a.size,
+      sha256: a.sha256,
       inline: false,
     })),
     outputs: requestedOutputs,
@@ -330,6 +410,8 @@ export {
   stripPaginationCss,
   normalizeCid,
   bufferToDataUrl,
+  attachmentChecksum,
+  attachmentListHtml,
   formatBaseName,
   formatDisplayDate,
   extractAttachments,
@@ -526,8 +608,9 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
  * filtering to the body in between, and reuse the same filtered body for
  * both PDF and Markdown.
  */
-function wrapForPdf(body, mail, timezone) {
+function wrapForPdf(body, mail, timezone, attachments = []) {
   const ccLine = mail.cc?.text ? `<div><strong>CC:</strong> ${esc(mail.cc.text)}</div>` : '';
+  const attachmentHtml = attachmentListHtml(attachments);
   const headerHtml = `
     <div style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #ccc;font-family:Arial,sans-serif;font-size:11pt;line-height:1.5">
       <div><strong>From:</strong> ${esc(mail.from?.text || 'Unknown')}</div>
@@ -554,7 +637,45 @@ function wrapForPdf(body, mail, timezone) {
         page-break-before:auto !important;
         break-before:auto !important;
       }
-    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${body}</div></body></html>`;
+    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${body}</div>${attachmentHtml}</body></html>`;
+}
+
+function attachmentChecksum(content) {
+  return createHash('sha256').update(content || Buffer.alloc(0)).digest('hex');
+}
+
+function attachmentIcon(contentType = '', filename = '') {
+  const ct = String(contentType).toLowerCase();
+  const name = String(filename).toLowerCase();
+  if (ct.includes('pdf') || name.endsWith('.pdf')) return '📄';
+  if (ct.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|tiff?)$/.test(name)) return '🖼️';
+  if (ct.includes('spreadsheet') || /\.(xlsx?|csv|ods)$/.test(name)) return '📊';
+  if (ct.includes('word') || /\.(docx?|odt|rtf)$/.test(name)) return '📝';
+  if (ct.includes('presentation') || /\.(pptx?|odp)$/.test(name)) return '📽️';
+  if (ct.includes('zip') || /\.(zip|rar|7z|tar|gz)$/.test(name)) return '🗜️';
+  return '📎';
+}
+
+function attachmentListHtml(attachments = []) {
+  if (!attachments.length) return '';
+  const rows = attachments.map(att => `
+    <li style="margin:4px 0;">
+      <span style="font-size:14px;margin-right:6px;">${attachmentIcon(att.contentType, att.filename)}</span>
+      <strong>${esc(att.filename || 'attachment')}</strong>
+      <span style="color:#666;"> — ${esc(att.contentType || 'application/octet-stream')}${typeof att.size === 'number' ? ` · ${esc(formatBytesLocal(att.size))}` : ''}</span>
+    </li>`).join('');
+  return `
+    <div style="margin-top:16px;padding-top:10px;border-top:1px solid #ddd;font-family:Arial,sans-serif;font-size:10.5pt;line-height:1.35;break-inside:avoid;page-break-inside:avoid;">
+      <div style="font-weight:bold;margin-bottom:6px;">Adjuntos (${attachments.length})</div>
+      <ul style="margin:0;padding-left:20px;">${rows}</ul>
+    </div>`;
+}
+
+function formatBytesLocal(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**
@@ -750,7 +871,24 @@ export async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, 
       return route.abort('blockedbyclient');
     }
 
-    return route.continue();
+    const cached = getCachedRemote(url);
+    if (cached) {
+      return route.fulfill({
+        status: cached.status,
+        headers: fulfillHeaders(cached.headers, cached.body.length),
+        body: cached.body,
+      });
+    }
+
+    try {
+      const response = await route.fetch();
+      const headers = response.headers();
+      const body = await response.body();
+      putCachedRemote(url, { status: response.status(), headers, body });
+      return route.fulfill({ status: response.status(), headers: fulfillHeaders(headers, body.length), body });
+    } catch {
+      return route.continue();
+    }
   });
 
   const page = await context.newPage();
@@ -861,6 +999,7 @@ function extractAttachments(mail, usedCids = new Set()) {
       contentType: att.contentType || 'application/octet-stream',
       content: att.content,
       size: att.size || att.content?.length || 0,
+      sha256: attachmentChecksum(att.content),
     });
   }
   return attachments;
