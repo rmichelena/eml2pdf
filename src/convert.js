@@ -327,7 +327,7 @@ export async function convertEmail(emlBuf, opts = {}) {
 
   const mail = await simpleParser(emlBuf, { skipImageLinks: true });
 
-  const { body: bodyRaw, inlineCount, usedCids } =
+  const { body: bodyRaw, inlineCount, usedCids, usedAttachmentIndexes } =
     buildHtml(mail, timezone, warnings);
 
   // Apply the remote-URL policy statically so both PDF and Markdown see the
@@ -336,7 +336,7 @@ export async function convertEmail(emlBuf, opts = {}) {
   // as defense in depth (catches anything our static analysis missed, e.g.
   // URLs inside @font-face rules).
   const filteredBody = await filterRemoteUrls(bodyRaw, { loadRemoteImages, warnings });
-  const attachments = extractAttachments(mail, usedCids);
+  const attachments = extractAttachments(mail, usedCids, { usedAttachmentIndexes });
 
   // PDF is the only path that touches Chromium — skip entirely when not asked.
   const pdfBuffer = wantPdf
@@ -537,25 +537,30 @@ function buildCidIndex(mail, warnings = []) {
   const cidMap = new Map();
   const byCid = new Map();
 
-  for (const att of mail.attachments || []) {
+  for (let index = 0; index < (mail.attachments || []).length; index++) {
+    const att = mail.attachments[index];
     if (!att.contentId || !att.contentType?.startsWith('image/')) continue;
     const cid = normalizeCid(att.contentId);
     const key = cid.toLowerCase();
     const sha256 = attachmentChecksum(att.content);
     const dataUrl = bufferToDataUrl(att.content, att.contentType);
     if (!byCid.has(key)) byCid.set(key, []);
-    byCid.get(key).push({ cid, sha256, dataUrl });
+    byCid.get(key).push({ cid, sha256, dataUrl, index });
   }
 
   for (const [key, entries] of byCid) {
     const distinctHashes = new Set(entries.map(e => e.sha256));
     if (distinctHashes.size > 1) {
-      warnings.push(`Duplicate Content-ID with different image content: ${entries[0].cid}`);
+      warnings.push(
+        `Duplicate Content-ID with different image content: ${entries[0].cid} ` +
+        `(${entries.length} MIME parts; resolving references in MIME order)`
+      );
     }
-    // Keep the first MIME part for deterministic replacement. If hashes differ
-    // the warning above is the important signal; guessing a later duplicate is
-    // more likely to move images around unexpectedly.
-    cidMap.set(key, entries[0].dataUrl);
+    // Keep all entries as a FIFO queue. Duplicate CIDs are malformed but common
+    // in Outlook/forwarded mail. Resolving references left-to-right against MIME
+    // order is not perfect, but it is better than overwriting or always using
+    // the first image for every occurrence.
+    cidMap.set(key, { entries, cursor: 0 });
   }
   return cidMap;
 }
@@ -564,17 +569,23 @@ function resolveCidImages(body, mail, warnings = []) {
   const cidMap = buildCidIndex(mail, warnings);
   const unresolvedCids = new Set();
   const usedCids = new Set();
+  const usedAttachmentIndexes = new Set();
 
   function resolveCid(rawCid) {
     const cid = normalizeCid(rawCid);
-    const dataUrl = cidMap.get(cid.toLowerCase());
-    if (!dataUrl) {
+    const queue = cidMap.get(cid.toLowerCase());
+    if (!queue || !queue.entries.length) {
       unresolvedCids.add(cid);
       return null;
     }
+    const entry = queue.entries[Math.min(queue.cursor, queue.entries.length - 1)];
+    // Advance only when there are duplicate MIME parts. If a single image is
+    // referenced several times, every occurrence should reuse that one part.
+    if (queue.entries.length > 1) queue.cursor++;
     usedCids.add(cid);
     usedCids.add(cid.toLowerCase());
-    return dataUrl;
+    usedAttachmentIndexes.add(entry.index);
+    return entry.dataUrl;
   }
 
   let bodyWithImages = String(body || '');
@@ -623,8 +634,8 @@ function resolveCidImages(body, mail, warnings = []) {
     warnings.push(`…and ${unresolvedList.length - MAX_UNRESOLVED_LISTED} more unresolved CID(s)`);
   }
 
-  const inlineCount = new Set([...usedCids].map(c => c.toLowerCase())).size;
-  return { body: bodyWithImages, inlineCount, usedCids };
+  const inlineCount = usedAttachmentIndexes.size || new Set([...usedCids].map(c => c.toLowerCase())).size;
+  return { body: bodyWithImages, inlineCount, usedCids, usedAttachmentIndexes };
 }
 
 function extractCidRefs(body) {
@@ -1015,8 +1026,10 @@ function extractAttachments(mail, usedCids = new Set(), options = {}) {
   const attachments = [];
   const seenNames = new Map(); // base name → count
   const removedCids = options.removedCids || new Set();
+  const usedAttachmentIndexes = options.usedAttachmentIndexes || null;
 
-  for (const att of mail.attachments || []) {
+  for (let index = 0; index < (mail.attachments || []).length; index++) {
+    const att = mail.attachments[index];
     if (!att.filename && !att.contentType) continue;
 
     // usedCids is the authoritative signal: it lists the CIDs whose data: URL
@@ -1025,7 +1038,9 @@ function extractAttachments(mail, usedCids = new Set(), options = {}) {
     // every multipart/related part, including ones whose cid: it couldn't
     // actually substitute, and including ones not referenced anywhere.
     const cid = att.contentId ? normalizeCid(att.contentId) : null;
-    const isInline = cid && (usedCids.has(cid) || usedCids.has(cid.toLowerCase()));
+    const isInline = usedAttachmentIndexes
+      ? usedAttachmentIndexes.has(index)
+      : cid && (usedCids.has(cid) || usedCids.has(cid.toLowerCase()));
     const wasRemovedWithQuote = cid && removedCids.has(cid.toLowerCase());
     if (isInline || wasRemovedWithQuote) continue;
 
@@ -1097,7 +1112,8 @@ function formatDisplayDate(date, timezone) {
 }
 
 function bufferToDataUrl(buf, mime) {
-  return `data:${mime};base64,${Buffer.from(buf).toString('base64')}`;
+  const cleanMime = String(mime || 'application/octet-stream').split(';')[0].trim() || 'application/octet-stream';
+  return `data:${cleanMime};base64,${Buffer.from(buf).toString('base64')}`;
 }
 
 function sanitizeFilename(name) {

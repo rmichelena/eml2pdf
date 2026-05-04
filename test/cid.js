@@ -220,15 +220,15 @@ ${SIG_B64}
 `, 'utf8');
   const mail = await simpleParser(eml, { skipImageLinks: true });
   const warnings = [];
-  const { inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
-  const attachments = extractAttachments(mail, usedCids);
+  const { inlineCount, usedCids, usedAttachmentIndexes } = buildHtmlForTest(mail, 'UTC', warnings);
+  const attachments = extractAttachments(mail, usedCids, { usedAttachmentIndexes });
   check('same bytes/different CIDs: only referenced CID suppresses attachment',
     inlineCount === 1 && usedCids.has('one@x') && !usedCids.has('two@x') &&
       attachments.length === 1 && attachments[0].filename === 'two.png',
-    { inlineCount, usedCids: [...usedCids], attachments: attachments.map(a => a.filename), warnings });
+    { inlineCount, usedCids: [...usedCids], usedAttachmentIndexes: [...usedAttachmentIndexes], attachments: attachments.map(a => a.filename), warnings });
 }
 
-// Same Content-ID with different bytes: deterministic replacement + warning.
+// Same Content-ID with different bytes: references consume MIME parts FIFO.
 {
   const OTHER_B64 = Buffer.from('different image bytes').toString('base64');
   const eml = Buffer.from(
@@ -240,7 +240,7 @@ Content-Type: multipart/related; boundary="B"
 --B
 Content-Type: text/html
 
-<img src="cid:dup@x">
+<img src="cid:dup@x"><img src="cid:dup@x">
 
 --B
 Content-Type: image/png
@@ -260,11 +260,24 @@ ${OTHER_B64}
 `, 'utf8');
   const mail = await simpleParser(eml, { skipImageLinks: true });
   const warnings = [];
-  const { inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const { body, inlineCount, usedCids, usedAttachmentIndexes } = buildHtmlForTest(mail, 'UTC', warnings);
   const dupWarning = warnings.some(w => /Duplicate Content-ID with different image content: dup@x/.test(w));
-  check('duplicate Content-ID with different hashes warns',
-    inlineCount === 1 && usedCids.has('dup@x') && dupWarning,
-    { inlineCount, usedCids: [...usedCids], warnings });
+  const firstUsed = body.includes(`data:image/png;base64,${SIG_B64}`);
+  const secondUsed = body.includes(`data:image/png;base64,${OTHER_B64}`);
+  const attachments = extractAttachments(mail, usedCids, { usedAttachmentIndexes });
+  check('duplicate Content-ID with different hashes resolves FIFO and warns',
+    inlineCount === 2 && usedCids.has('dup@x') && dupWarning && firstUsed && secondUsed && attachments.length === 0,
+    { inlineCount, usedCids: [...usedCids], usedAttachmentIndexes: [...usedAttachmentIndexes], warnings, firstUsed, secondUsed, attachments: attachments.map(a => a.filename), body });
+}
+
+// MIME parameters are stripped from data: URL media type.
+{
+  const mail = await simpleParser(makeEml('<img src="cid:sig123@example.com">'), { skipImageLinks: true });
+  mail.attachments[0].contentType = 'image/png; name="signature.png"';
+  const { body } = buildHtmlForTest(mail, 'UTC', []);
+  check('data URL MIME type is parameter-free',
+    body.includes('data:image/png;base64,') && !body.includes('data:image/png; name='),
+    { body: body.slice(0, 300) });
 }
 
 // =====================================================================

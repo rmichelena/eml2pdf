@@ -504,7 +504,7 @@ export async function convertThread(rawMessages, opts = {}) {
       }
     }
 
-    const { body: bodyWithImages, usedCids } = resolveCidImages(processedBody, mail, warnings);
+    const { body: bodyWithImages, usedCids, usedAttachmentIndexes } = resolveCidImages(processedBody, mail, warnings);
     processedBody = bodyWithImages;
 
     // Apply remote URL policy
@@ -525,7 +525,7 @@ export async function convertThread(rawMessages, opts = {}) {
     const to = (mail.to?.value || []).map(a => a.text || a.address);
     const cc = (mail.cc?.value || []).map(a => a.text || a.address);
 
-    const msgAttachments = extractAttachments(mail, usedCids, { removedCids });
+    const msgAttachments = extractAttachments(mail, usedCids, { removedCids, usedAttachmentIndexes });
     // Tag each attachment with the message date for dedup renaming
     for (const att of msgAttachments) {
       att._msgDate = date.getTime();
