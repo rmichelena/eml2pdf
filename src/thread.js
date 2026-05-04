@@ -14,17 +14,12 @@
 
 import { simpleParser } from 'mailparser';
 import archiver from 'archiver';
-import sanitizeHtml from 'sanitize-html';
 import { getTurndownService, mdEscapeInline, formatBytes, formatTimestampStem, formatDateSuffix } from './textutil.js';
 
 import {
   buildHtmlForTest as buildSingleHtml,
   filterRemoteUrlsForTest as filterRemoteUrls,
-  EMAIL_ALLOWED_TAGS,
-  EMAIL_ALLOWED_ATTRS,
-  stripPaginationCss,
-  normalizeCid,
-  bufferToDataUrl,
+  EMAIL_RENDER_CSP,
   formatDisplayDate,
   extractAttachments,
   escapeHtml,
@@ -36,7 +31,7 @@ import {
 
 // Separators Gmail/Outlook/etc. insert before quoted text
 const QUOTE_SEPARATOR_RE =
-  /^\s*(?:On .+ wrote:|El .+ escribió?:|De:|From:|-----Original Message-----)/i;
+  /^\s*(?:On .{1,120}? wrote\s*:|El .{1,120}? escribi[oó]\s*:|-----Original Message-----)/i;
 
 /**
  * Strip quoted blocks from HTML body using DOM-aware parsing.
@@ -95,22 +90,21 @@ export function stripQuotesHtml(html) {
   // The `^` anchor + multiline flag ensures we only match separator text that
   // occupies its own block element, not embedded in running paragraph text.
   const separatorPatterns = [
-    /^On .{1,80}? wrote:/im,                    // English
-    /^El .{1,80}? escribió:/im,                 // Spanish
-    /^Le .{1,80}? a écrit\s*:/im,               // French
-    /^Am .{1,80}? schrieb/im,                    // German
-    /^.{1,80}? ha scritto:/im,                  // Italian
-    /^.{1,80}? escreveu:/im,                    // Portuguese
-    /^-{3,}\s*Original Message\s*-{3,}/im,      // Outlook EN
-    /^-{3,}\s*Mensaje original\s*-{3,}/im,      // Outlook ES
+    /^On .{1,120}? wrote\s*:\s*$/im,                    // English
+    /^El .{1,120}? escribi[oó]\s*:\s*$/im,              // Spanish
+    /^Le .{1,120}? a écrit\s*:\s*$/im,                  // French
+    /^Am .{1,120}? schrieb\s*:?\s*$/im,                 // German
+    /^.{1,120}? ha scritto\s*:\s*$/im,                  // Italian
+    /^.{1,120}? escreveu\s*:\s*$/im,                    // Portuguese
+    /^-{3,}\s*Original Message\s*-{3,}\s*$/im,          // Outlook EN
+    /^-{3,}\s*Mensaje original\s*-{3,}\s*$/im,          // Outlook ES
   ];
 
+  const plainText = result
+    .replace(/<\/(?:div|p|blockquote|section|article|aside|header|footer|main)>/gi, '\n')
+    .replace(/<[^>]+>/g, '');
+
   for (const pat of separatorPatterns) {
-    // Build plain text with newlines at block-element closing tags.
-    // `^` in multiline mode matches after each \n → aligns with element boundaries.
-    const plainText = result
-      .replace(/<\/(?:div|p|blockquote|section|article|aside|header|footer|main)>/gi, '\n')
-      .replace(/<[^>]+>/g, '');
     const m = plainText.match(pat);
     if (!m) continue;
 
@@ -126,7 +120,7 @@ export function stripQuotesHtml(html) {
     // We also track lastBlockOpen: the HTML position of the last opening
     // block tag before the separator — this is where we cut.
     const targetTextPos = m.index;
-    let htmlIdx = 0, textIdx = 0, lastBlockOpen = -1, prevCharWasNewline = true;
+    let htmlIdx = 0, textIdx = 0, lastBlockOpen = -1;
 
     while (htmlIdx < result.length) {
       if (result[htmlIdx] === '<') {
@@ -136,7 +130,6 @@ export function stripQuotesHtml(html) {
         );
         if (closeMatch) {
           textIdx++; // count the newline
-          prevCharWasNewline = true;
           htmlIdx += closeMatch[0].length;
           continue;
         }
@@ -152,7 +145,6 @@ export function stripQuotesHtml(html) {
         if (textIdx >= targetTextPos) break;
         textIdx++;
         htmlIdx++;
-        prevCharWasNewline = false;
       }
     }
 
@@ -299,25 +291,11 @@ function buildThreadHtml(messages, timezone) {
 </div>`);
   }
 
-  // P4 fix: CSP defense-in-depth, same as convert.js wrapForPdf
-  const csp = [
-    "default-src 'none'",
-    "img-src http: https: data: cid:",
-    "style-src 'unsafe-inline' http: https:",
-    "font-src http: https: data:",
-    "media-src http: https: data:",
-    "script-src 'none'",
-    "frame-src 'none'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'none'",
-  ].join('; ');
-
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="${csp}">
+<meta http-equiv="Content-Security-Policy" content="${EMAIL_RENDER_CSP}">
 <style>
   @page { size: auto; margin: 0 }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; }
@@ -412,8 +390,6 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
   return lines.join('\n') + '\n';
 }
 
-// ─── Date formatting for filenames ────────────────────────────────────
-
 // ─── Main thread conversion ──────────────────────────────────────────
 
 /**
@@ -479,20 +455,22 @@ export async function convertThread(rawMessages, opts = {}) {
       );
     }
 
-    if (emlBuf.length === 0) {
-      throw Object.assign(
-        new Error(`messages[${i}] has empty payload`),
-        { status: 400 }
-      );
-    }
 
     const mail = await simpleParser(emlBuf);
 
     // Build HTML using convert.js's proven pipeline (CID resolution, sanitize, etc.)
     const { body: bodyRaw, usedCids } = buildSingleHtml(mail, timezone, warnings);
 
-    // Strip quotes BEFORE filtering remote URLs
-    let processedBody = doStrip ? stripQuotesHtml(bodyRaw) : bodyRaw;
+    // Strip quotes BEFORE filtering remote URLs. For text/plain-only mail,
+    // rebuild the HTML from stripped text so `>` quote lines do not survive
+    // through mailparser's generated textAsHtml.
+    const strippedText = doStrip ? stripQuotesText(mail.text) : (mail.text || '');
+    let processedBody;
+    if (doStrip && !mail.html && mail.text) {
+      processedBody = `<p>${escapeHtml(strippedText).replace(/\n/g, '<br>')}</p>`;
+    } else {
+      processedBody = doStrip ? stripQuotesHtml(bodyRaw) : bodyRaw;
+    }
 
     // Apply remote URL policy
     processedBody = await filterRemoteUrls(processedBody, { loadRemoteImages, warnings });
@@ -528,7 +506,7 @@ export async function convertThread(rawMessages, opts = {}) {
       cc,
       date,
       html: processedBody,
-      text: doStrip ? stripQuotesText(mail.text) : (mail.text || ''),
+      text: strippedText,
       attachments: msgAttachments,
     });
   }

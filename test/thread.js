@@ -1,6 +1,9 @@
 // Integration tests for /convert-thread endpoint
 // Run with: node /tmp/test-thread-api.mjs
 
+import { execSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+
 const BASE = 'http://localhost:3005';
 let passed = 0, failed = 0;
 
@@ -22,6 +25,19 @@ function buildEml(opts) {
   } else {
     eml += `Content-Type: text/html; charset=utf-8\n\n${body}`;
   }
+  return Buffer.from(eml).toString('base64url');
+}
+
+function buildTextEml(opts) {
+  const { from, to, subject, date, body } = opts;
+  const eml = `From: ${from}
+To: ${to}
+Subject: ${subject}
+Date: ${date}
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+${body}`;
   return Buffer.from(eml).toString('base64url');
 }
 
@@ -120,8 +136,6 @@ console.log('=== /convert-thread tests ===\n');
   assertEqual(res.status, 200, '/convert regression: 200');
 }
 
-import { execSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
 
 function extractMd(buf) {
   const tmpZip = `/tmp/test-thread-${Date.now()}.zip`;
@@ -198,6 +212,46 @@ function extractMd(buf) {
     const sec = md.split('## Message 2')[1] || '';
     assert(sec.includes('Sounds good'), 'EN real quote: reply preserved');
     assert(!sec.includes('On Mon, Apr 28'), 'EN real quote: separator stripped');
+  }
+}
+
+// 13. text/plain quoteMode strip removes > quote lines from Markdown
+{
+  const msg = buildTextEml({
+    from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Plain',
+    date: 'Mon, 28 Apr 2025 10:00:00 +0200',
+    body: 'Fresh reply line\n\n> Old quoted line\n> Another old line',
+  });
+
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'], quoteMode: 'strip' },
+  });
+  assertEqual(res.status, 200, 'text/plain strip: 200');
+  if (res.ok) {
+    const md = extractMd(Buffer.from(await res.arrayBuffer()));
+    assert(md.includes('Fresh reply line'), 'text/plain strip: reply preserved');
+    assert(!md.includes('Old quoted line'), 'text/plain strip: quoted line removed');
+  }
+}
+
+// 14. threadId is sanitized before JSON metadata
+{
+  const msg = buildEml({ from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Thread id', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: '<p>Hi</p>' });
+  const res = await post('/convert-thread', {
+    threadId: '../bad/id',
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'] },
+  });
+  assertEqual(res.status, 200, 'threadId sanitize: 200');
+  if (res.ok) {
+    const tmpZip = `/tmp/test-thread-json-${Date.now()}.zip`;
+    const buf = Buffer.from(await res.arrayBuffer());
+    writeFileSync(tmpZip, buf);
+    try {
+      const json = JSON.parse(execSync(`unzip -p ${tmpZip} '*thread.json'`).toString());
+      assert(json.threadId === '__bad_id', 'threadId sanitize: metadata sanitized');
+    } finally { try { execSync(`rm -f ${tmpZip}`); } catch {} }
   }
 }
 

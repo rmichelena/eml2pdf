@@ -1,12 +1,16 @@
 import { getTurndownService, mdEscapeInline, formatBytes } from './textutil.js';
 
+let _service = null;
+
 function service() {
+  if (_service) return _service;
   const td = getTurndownService();
   td.addRule('drop-eml2pdf-wrapper', {
     filter: (node) => node.id === 'eml2pdf-email-body',
     replacement: (content) => content,
   });
-  return td;
+  _service = td;
+  return _service;
 }
 
 export function buildMarkdown(mail, bodyWithImages, metadata) {

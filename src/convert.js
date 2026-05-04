@@ -4,6 +4,20 @@ import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
 import { isPrivateHost } from './netfilter.js';
 import { buildMarkdown } from './markdown.js';
+import { formatTimestampStem } from './textutil.js';
+
+export const EMAIL_RENDER_CSP = [
+  "default-src 'none'",
+  "img-src http: https: data: cid:",
+  "style-src 'unsafe-inline' http: https:",
+  "font-src http: https: data:",
+  "media-src http: https: data:",
+  "script-src 'none'",
+  "frame-src 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+].join('; ');
 
 // Permissive but explicit tag allowlist for email HTML.
 // Excludes by omission: script, iframe, object, embed, frame, frameset, applet,
@@ -523,23 +537,8 @@ function wrapForPdf(body, mail, timezone) {
       ${mail.date ? `<div><strong>Date:</strong> ${esc(formatDisplayDate(mail.date, timezone))}</div>` : ''}
     </div>`;
 
-  // Permissive CSP: allow images/styles/fonts from network for fidelity,
-  // but block scripts, frames, objects, forms.
-  const csp = [
-    "default-src 'none'",
-    "img-src http: https: data: cid:",
-    "style-src 'unsafe-inline' http: https:",
-    "font-src http: https: data:",
-    "media-src http: https: data:",
-    "script-src 'none'",
-    "frame-src 'none'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'none'",
-  ].join('; ');
-
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
-      <meta http-equiv="Content-Security-Policy" content="${csp}">
+      <meta http-equiv="Content-Security-Policy" content="${EMAIL_RENDER_CSP}">
       <style>
       @page { size: auto; margin: 0 }
       html,body{margin:0;padding:0;width:100%}
@@ -894,23 +893,7 @@ async function createZip({ baseName, pdfBuffer, markdownText, metadata, attachme
 // Date-prefixed filename stem, e.g. "2025-01-15 10-30 email" — extension
 // (`.pdf`/`.md`/`.json`) is appended by the ZIP writer.
 function formatBaseName(date, timezone) {
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, '0');
-  let yyyy, mm, dd, hh, min;
-  try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false,
-    }).formatToParts(d);
-    const get = (type) => parts.find(p => p.type === type)?.value || '00';
-    yyyy = get('year'); mm = get('month'); dd = get('day');
-    hh = get('hour'); min = get('minute');
-  } catch {
-    yyyy = d.getUTCFullYear(); mm = pad(d.getUTCMonth() + 1); dd = pad(d.getUTCDate());
-    hh = pad(d.getUTCHours()); min = pad(d.getUTCMinutes());
-  }
-  return `${yyyy}-${mm}-${dd} ${hh}-${min} email`;
+  return formatTimestampStem(date, timezone, 'email');
 }
 
 function formatDisplayDate(date, timezone) {

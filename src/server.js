@@ -1,6 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { convertEmail, shutdownBrowser } from './convert.js';
+import { convertEmail, shutdownBrowser, sanitizeFilename } from './convert.js';
 import { convertThread } from './thread.js';
 import { parseMultipart } from './multipart.js';
 
@@ -306,7 +306,7 @@ async function handleConvertThread(req, res, requestId) {
       : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
 
     const opts = {
-      threadId: body.threadId || undefined,
+      threadId: body.threadId ? sanitizeFilename(String(body.threadId)) : undefined,
       timezone: typeof options.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
       outputs: requestedOutputs,
       quoteMode,
