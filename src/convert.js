@@ -325,7 +325,7 @@ export async function convertEmail(emlBuf, opts = {}) {
 
   const warnings = [];
 
-  const mail = await simpleParser(emlBuf);
+  const mail = await simpleParser(emlBuf, { skipImageLinks: true });
 
   const { body: bodyRaw, inlineCount, usedCids } =
     buildHtml(mail, timezone, warnings);
@@ -434,29 +434,15 @@ export {
   attachmentListHtml,
   formatBaseName,
   formatDisplayDate,
+  resolveCidImages,
+  extractCidRefs,
   extractAttachments,
   escapeHtml,
   sanitizeFilename,
 };
 
-function buildHtml(mail, timezone = 'UTC', warnings = []) {
+function buildHtml(mail, timezone = 'UTC', warnings = [], options = {}) {
   const attachments = mail.attachments || [];
-
-  // Build a cid → data URL map for all image attachments with a Content-ID,
-  // and a parallel cid → dataUrl record we'll use later to detect which
-  // images actually ended up inline in the rendered HTML.
-  // Casing is inconsistent across clients, so index both canonical and lowercase.
-  const cidMap = new Map();
-  const dataUrlByCid = new Map();
-  for (const att of attachments) {
-    if (att.contentId && att.contentType?.startsWith('image/')) {
-      const cid = normalizeCid(att.contentId);
-      const dataUrl = bufferToDataUrl(att.content, att.contentType);
-      cidMap.set(cid, dataUrl);
-      cidMap.set(cid.toLowerCase(), dataUrl);
-      dataUrlByCid.set(cid, dataUrl);
-    }
-  }
 
   let rawHtml = mail.html || mail.textAsHtml || escapeHtml(mail.text || '');
 
@@ -536,51 +522,88 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     (_, open, css, close) => `${open}${stripPaginationCss(css)}${close}`
   );
 
-  // Resolve any cid: → data: that mailparser didn't already inline.
-  // mailparser auto-resolves `<img src="cid:...">` for multipart/related
-  // emails, but only the canonical quoted form — unquoted attributes,
-  // case-mismatched CIDs, `background=cid:...` (legacy Outlook/marketing),
-  // and CSS `url(cid:...)` slip through. Chromium can't load cid: itself
-  // in setContent and our context.route would block it anyway, so anything
-  // not replaced here would fail to render.
+  if (options.resolveCids === false) {
+    return {
+      body: cleanBodyNoPagination,
+      inlineCount: 0,
+      usedCids: new Set(),
+    };
+  }
+
+  return resolveCidImages(cleanBodyNoPagination, mail, warnings);
+}
+
+function buildCidIndex(mail, warnings = []) {
+  const cidMap = new Map();
+  const byCid = new Map();
+
+  for (const att of mail.attachments || []) {
+    if (!att.contentId || !att.contentType?.startsWith('image/')) continue;
+    const cid = normalizeCid(att.contentId);
+    const key = cid.toLowerCase();
+    const sha256 = attachmentChecksum(att.content);
+    const dataUrl = bufferToDataUrl(att.content, att.contentType);
+    if (!byCid.has(key)) byCid.set(key, []);
+    byCid.get(key).push({ cid, sha256, dataUrl });
+  }
+
+  for (const [key, entries] of byCid) {
+    const distinctHashes = new Set(entries.map(e => e.sha256));
+    if (distinctHashes.size > 1) {
+      warnings.push(`Duplicate Content-ID with different image content: ${entries[0].cid}`);
+    }
+    // Keep the first MIME part for deterministic replacement. If hashes differ
+    // the warning above is the important signal; guessing a later duplicate is
+    // more likely to move images around unexpectedly.
+    cidMap.set(key, entries[0].dataUrl);
+  }
+  return cidMap;
+}
+
+function resolveCidImages(body, mail, warnings = []) {
+  const cidMap = buildCidIndex(mail, warnings);
   const unresolvedCids = new Set();
+  const usedCids = new Set();
 
   function resolveCid(rawCid) {
     const cid = normalizeCid(rawCid);
-    const dataUrl = cidMap.get(cid) || cidMap.get(cid.toLowerCase());
+    const dataUrl = cidMap.get(cid.toLowerCase());
     if (!dataUrl) {
       unresolvedCids.add(cid);
       return null;
     }
+    usedCids.add(cid);
+    usedCids.add(cid.toLowerCase());
     return dataUrl;
   }
 
-  let bodyWithImages = cleanBodyNoPagination;
+  let bodyWithImages = String(body || '');
 
-  // Pass 1: <img src="cid:..."> and <source src="cid:...">
+  // src="cid:..." / background="cid:..." — quoted or unquoted.
   bodyWithImages = bodyWithImages.replace(
-    /\bsrc\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
-    (m, q, rawCid) => {
+    /\b(src|background)\s*=\s*(["']?)\s*cid:([^"'\s>]+)\2/gi,
+    (m, attr, q, rawCid) => {
       const dataUrl = resolveCid(rawCid);
       if (!dataUrl) return m;
       const quote = q || '"';
-      return `src=${quote}${dataUrl}${quote}`;
+      return `${attr}=${quote}${dataUrl}${quote}`;
     }
   );
 
-  // Pass 2: <body background="cid:...">, <table background="cid:...">,
-  //         <td background="cid:..."> — legacy Outlook/marketing pattern.
+  // srcset="cid:... 1x, cid:... 2x". We replace CID URLs inside the
+  // attribute value and keep descriptors intact.
   bodyWithImages = bodyWithImages.replace(
-    /\bbackground\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
-    (m, q, rawCid) => {
-      const dataUrl = resolveCid(rawCid);
-      if (!dataUrl) return m;
-      const quote = q || '"';
-      return `background=${quote}${dataUrl}${quote}`;
+    /\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi,
+    (m, q, value) => {
+      const replaced = value.replace(/(^|[,\s])cid:([^,\s]+)/gi, (mm, prefix, rawCid) => {
+        const dataUrl = resolveCid(rawCid);
+        return dataUrl ? `${prefix}${dataUrl}` : mm;
+      });
+      return `srcset=${q}${replaced}${q}`;
     }
   );
 
-  // Pass 3: CSS url(cid:...) inside style="..." attributes or <style> blocks.
+  // CSS url(cid:...) inside style="..." attributes or <style> blocks.
   bodyWithImages = bodyWithImages.replace(
     /url\s*\(\s*(["']?)\s*cid:([^"'\s)]+)\1\s*\)/gi,
     (m, q, rawCid) => {
@@ -591,25 +614,6 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     }
   );
 
-  // Determine which image attachments actually made it inline by checking the
-  // final HTML for their data: URL. This is robust regardless of which path
-  // performed the substitution (mailparser pre-render, our regex above, or
-  // even an exotic third route). Comparing the full data URL is fine
-  // performance-wise: one substring scan per image attachment per request.
-  const usedCids = new Set();
-  for (const [cid, dataUrl] of dataUrlByCid) {
-    if (bodyWithImages.includes(dataUrl)) {
-      usedCids.add(cid);
-      usedCids.add(cid.toLowerCase());
-    }
-  }
-  const inlineCount = usedCids.size > 0
-    ? new Set([...usedCids].map(c => c.toLowerCase())).size
-    : 0;
-
-  // Surface unresolved CIDs individually so metadata.json is diagnostic.
-  // Cap the listing to keep the array bounded if a malformed email references
-  // dozens of broken cids.
   const MAX_UNRESOLVED_LISTED = 10;
   const unresolvedList = [...unresolvedCids];
   for (const cid of unresolvedList.slice(0, MAX_UNRESOLVED_LISTED)) {
@@ -619,11 +623,26 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     warnings.push(`…and ${unresolvedList.length - MAX_UNRESOLVED_LISTED} more unresolved CID(s)`);
   }
 
-  return {
-    body: bodyWithImages,
-    inlineCount,
-    usedCids,
-  };
+  const inlineCount = new Set([...usedCids].map(c => c.toLowerCase())).size;
+  return { body: bodyWithImages, inlineCount, usedCids };
+}
+
+function extractCidRefs(body) {
+  const refs = new Set();
+  const s = String(body || '');
+  const patterns = [
+    /\b(?:src|background)\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
+    /url\s*\(\s*(["']?)\s*cid:([^"'\s)]+)\1\s*\)/gi,
+    /\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi,
+  ];
+  for (const m of s.matchAll(patterns[0])) refs.add(normalizeCid(m[2]).toLowerCase());
+  for (const m of s.matchAll(patterns[1])) refs.add(normalizeCid(m[2]).toLowerCase());
+  for (const m of s.matchAll(patterns[2])) {
+    for (const cm of m[2].matchAll(/(^|[,\s])cid:([^,\s]+)/gi)) {
+      refs.add(normalizeCid(cm[2]).toLowerCase());
+    }
+  }
+  return refs;
 }
 
 /**
@@ -992,9 +1011,10 @@ export async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, 
   }
 }
 
-function extractAttachments(mail, usedCids = new Set()) {
+function extractAttachments(mail, usedCids = new Set(), options = {}) {
   const attachments = [];
   const seenNames = new Map(); // base name → count
+  const removedCids = options.removedCids || new Set();
 
   for (const att of mail.attachments || []) {
     if (!att.filename && !att.contentType) continue;
@@ -1006,7 +1026,8 @@ function extractAttachments(mail, usedCids = new Set()) {
     // actually substitute, and including ones not referenced anywhere.
     const cid = att.contentId ? normalizeCid(att.contentId) : null;
     const isInline = cid && (usedCids.has(cid) || usedCids.has(cid.toLowerCase()));
-    if (isInline) continue;
+    const wasRemovedWithQuote = cid && removedCids.has(cid.toLowerCase());
+    if (isInline || wasRemovedWithQuote) continue;
 
     let name = sanitizeFilename(att.filename || `attachment-${attachments.length}`);
     // Disambiguate duplicates so ZIP entries don't overwrite

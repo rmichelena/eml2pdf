@@ -41,6 +41,17 @@ ${body}`;
   return Buffer.from(eml).toString('base64url');
 }
 
+function buildRelatedEml(opts) {
+  const { from, to, subject, date, body, images } = opts;
+  const boundary = 'rel_' + Math.random().toString(36).slice(2);
+  let eml = `From: ${from}\nTo: ${to}\nSubject: ${subject}\nDate: ${date}\nMIME-Version: 1.0\nContent-Type: multipart/related; boundary="${boundary}"\n\n--${boundary}\nContent-Type: text/html; charset=utf-8\n\n${body}\n`;
+  for (const img of images) {
+    eml += `\n--${boundary}\nContent-Type: ${img.contentType || 'image/png'}\nContent-ID: <${img.cid}>\nContent-Transfer-Encoding: base64\nContent-Disposition: inline; filename="${img.name}"\n\n${Buffer.from(img.content).toString('base64')}\n`;
+  }
+  eml += `\n--${boundary}--`;
+  return Buffer.from(eml).toString('base64url');
+}
+
 async function post(endpoint, body) {
   return fetch(`${BASE}${endpoint}`, {
     method: 'POST',
@@ -144,7 +155,39 @@ function extractMd(buf) {
   finally { try { execSync(`rm -f ${tmpZip}`); } catch {} }
 }
 
-// 9. Quote strip with Italian locale — reply preserved, quote removed
+function listZip(buf) {
+  const tmpZip = `/tmp/test-thread-${Date.now()}-${Math.random().toString(36).slice(2)}.zip`;
+  writeFileSync(tmpZip, buf);
+  try { return execSync(`unzip -Z1 ${tmpZip}`).toString().trim().split('\n').filter(Boolean); }
+  finally { try { execSync(`rm -f ${tmpZip}`); } catch {} }
+}
+
+// 9. quoteMode strip resolves CIDs after quote removal and does not emit
+// images that only existed in the stripped quote as attachments.
+{
+  const msg = buildRelatedEml({
+    from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'CID strip', date: 'Mon, 28 Apr 2025 10:00:00 +0200',
+    body: '<p>Current</p><img src="cid:body@x"><blockquote class="gmail_quote"><p>Old</p><img src="cid:quote@x"></blockquote>',
+    images: [
+      { cid: 'body@x', name: 'body.png', content: 'body-image' },
+      { cid: 'quote@x', name: 'quote.png', content: 'quote-image' },
+    ],
+  });
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'], quoteMode: 'strip' },
+  });
+  assertEqual(res.status, 200, 'cid strip: 200');
+  if (res.ok) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    const names = listZip(buf);
+    const md = extractMd(buf);
+    assert(md.includes('Current') && !md.includes('Old'), 'cid strip: quoted body removed');
+    assert(!names.some(n => /attachments\/(body|quote)\.png$/.test(n)), 'cid strip: inline/removed quote images not emitted as attachments');
+  }
+}
+
+// 10. Quote strip with Italian locale — reply preserved, quote removed
 {
   const msg1 = buildEml({ from: 'A <a@a.it>', to: 'B <b@b.it>', subject: 'Ciao', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: '<p>Messaggio originale.</p>' });
   const msg2 = buildEml({ from: 'B <b@b.it>', to: 'A <a@a.it>', subject: 'Re: Ciao', date: 'Mon, 28 Apr 2025 10:30:00 +0200', body: '<p>La mia risposta</p><div>Bob ha scritto:</div><div>contenuto vecchio</div>' });

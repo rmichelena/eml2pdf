@@ -50,7 +50,7 @@ function check(label, cond, ctx = {}) {
 }
 
 async function buildBoth(emlBuf) {
-  const mail = await simpleParser(emlBuf);
+  const mail = await simpleParser(emlBuf, { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
   const metadata = {
@@ -70,7 +70,7 @@ async function buildBoth(emlBuf) {
 }
 
 async function buildBody(emlBuf) {
-  const mail = await simpleParser(emlBuf);
+  const mail = await simpleParser(emlBuf, { skipImageLinks: true });
   const warnings = [];
   const { body } = buildHtmlForTest(mail, 'UTC', warnings);
   return { body, warnings };
@@ -97,7 +97,7 @@ async function buildBody(emlBuf) {
 
 // 1b. Markdown injection via subject / message-id / from is neutralized.
 {
-  const mail = await simpleParser(eml('<p>safe body</p>'));
+  const mail = await simpleParser(eml('<p>safe body</p>'), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const malicious = {
     messageId: '<a@b>\n# INJECTED-MID\n',
@@ -186,7 +186,7 @@ async function buildBody(emlBuf) {
 
 // 6. Attachments section appears when metadata has attachments.
 {
-  const mail = await simpleParser(eml('<p>x</p>'));
+  const mail = await simpleParser(eml('<p>x</p>'), { skipImageLinks: true });
   const warnings = [];
   const { body } = buildHtmlForTest(mail, 'UTC', warnings);
   const metadata = {
@@ -210,7 +210,7 @@ async function buildBody(emlBuf) {
 
 // 7. Warnings section appears when warnings array is non-empty.
 {
-  const mail = await simpleParser(eml('<p>x</p>'));
+  const mail = await simpleParser(eml('<p>x</p>'), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const metadata = {
     subject: 's', from: '', to: [], cc: [], date: null, timezone: 'UTC',
@@ -236,7 +236,7 @@ MIME-Version: 1.0
 Content-Type: text/plain
 
 `, 'utf8');
-  const mail = await simpleParser(emptyEml);
+  const mail = await simpleParser(emptyEml, { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const md = buildMarkdown(mail, body, {
     subject: mail.subject, from: '', to: [], cc: [], date: null, timezone: 'UTC',

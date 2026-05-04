@@ -23,6 +23,8 @@ import {
   EMAIL_RENDER_CSP,
   EMAIL_RENDER_DEFENSIVE_CSS,
   formatDisplayDate,
+  resolveCidImages,
+  extractCidRefs,
   extractAttachments,
   attachmentListHtml,
   escapeHtml,
@@ -477,21 +479,33 @@ export async function convertThread(rawMessages, opts = {}) {
     }
 
 
-    const mail = await simpleParser(emlBuf);
+    const mail = await simpleParser(emlBuf, { skipImageLinks: true });
 
-    // Build HTML using convert.js's proven pipeline (CID resolution, sanitize, etc.)
-    const { body: bodyRaw, usedCids } = buildSingleHtml(mail, timezone, warnings);
+    // Build sanitized HTML first. CID resolution must happen after quote
+    // stripping so inline/attachment decisions reflect the final rendered body.
+    const { body: bodyRaw } = buildSingleHtml(mail, timezone, warnings, { resolveCids: false });
 
     // Strip quotes BEFORE filtering remote URLs. For text/plain-only mail,
     // rebuild the HTML from stripped text so `>` quote lines do not survive
     // through mailparser's generated textAsHtml.
     const strippedText = doStrip ? stripQuotesText(mail.text) : (mail.text || '');
     let processedBody;
+    const cidRefsBeforeStrip = doStrip ? extractCidRefs(bodyRaw) : new Set();
     if (doStrip && !mail.html && mail.text) {
       processedBody = `<p>${escapeHtml(strippedText).replace(/\n/g, '<br>')}</p>`;
     } else {
       processedBody = doStrip ? stripQuotesHtml(bodyRaw) : bodyRaw;
     }
+    const cidRefsAfterStrip = doStrip ? extractCidRefs(processedBody) : new Set();
+    const removedCids = new Set();
+    if (doStrip) {
+      for (const cid of cidRefsBeforeStrip) {
+        if (!cidRefsAfterStrip.has(cid)) removedCids.add(cid);
+      }
+    }
+
+    const { body: bodyWithImages, usedCids } = resolveCidImages(processedBody, mail, warnings);
+    processedBody = bodyWithImages;
 
     // Apply remote URL policy
     processedBody = await filterRemoteUrls(processedBody, { loadRemoteImages, warnings });
@@ -511,7 +525,7 @@ export async function convertThread(rawMessages, opts = {}) {
     const to = (mail.to?.value || []).map(a => a.text || a.address);
     const cc = (mail.cc?.value || []).map(a => a.text || a.address);
 
-    const msgAttachments = extractAttachments(mail, usedCids);
+    const msgAttachments = extractAttachments(mail, usedCids, { removedCids });
     // Tag each attachment with the message date for dedup renaming
     for (const att of msgAttachments) {
       att._msgDate = date.getTime();
