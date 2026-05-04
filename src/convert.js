@@ -20,6 +20,26 @@ export const EMAIL_RENDER_CSP = [
   "form-action 'none'",
 ].join('; ');
 
+// Outlook Web App sometimes embeds its full loading screen markup/CSS inside
+// forwarded/saved messages. If preserved, the fixed white overlay can cover
+// the entire Chromium viewport and produce a visually blank PDF. We remove the
+// known loader nodes during sanitization and also hide them in the wrapper CSS
+// as a second line of defense.
+const OWA_LOADER_IDS = new Set(['loadingscreen', 'loadinglogo', 'mslogo']);
+
+export const EMAIL_RENDER_DEFENSIVE_CSS = `
+      #eml2pdf-email-body [id="loadingScreen"],
+      #eml2pdf-email-body [id="loadingLogo"],
+      #eml2pdf-email-body [id="MSLogo"],
+      .eml2pdf-message-body [id="loadingScreen"],
+      .eml2pdf-message-body [id="loadingLogo"],
+      .eml2pdf-message-body [id="MSLogo"]{
+        display:none !important;
+        visibility:hidden !important;
+        opacity:0 !important;
+        pointer-events:none !important;
+      }`;
+
 // Permissive but explicit tag allowlist for email HTML.
 // Excludes by omission: script, iframe, object, embed, frame, frameset, applet,
 // form/input/button/textarea/select/option/label/fieldset/legend, base, link, noscript.
@@ -491,6 +511,10 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
       img: ['http', 'https', 'data', 'cid'],
     },
     parseStyleAttributes: false, // keep style attrs as-is for fidelity
+    exclusiveFilter(frame) {
+      const id = String(frame.attribs?.id || '').toLowerCase();
+      return OWA_LOADER_IDS.has(id);
+    },
     // We intentionally keep <style> in the allowlist — it's essential for
     // email rendering fidelity (Outlook/marketing emails rely heavily on it).
     // Defenses in depth that make this safe here:
@@ -637,6 +661,7 @@ function wrapForPdf(body, mail, timezone, attachments = []) {
         page-break-before:auto !important;
         break-before:auto !important;
       }
+${EMAIL_RENDER_DEFENSIVE_CSS}
     </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${body}</div>${attachmentHtml}</body></html>`;
 }
 

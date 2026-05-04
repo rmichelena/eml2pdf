@@ -21,6 +21,7 @@ import {
   buildHtmlForTest as buildSingleHtml,
   filterRemoteUrlsForTest as filterRemoteUrls,
   EMAIL_RENDER_CSP,
+  EMAIL_RENDER_DEFENSIVE_CSS,
   formatDisplayDate,
   extractAttachments,
   attachmentListHtml,
@@ -303,7 +304,7 @@ function buildThreadHtml(messages, timezone) {
       <tr><td style="font-weight: bold;">Subject:</td><td>${escapeHtml(msg.subject)}</td></tr>
     </table>
   </div>
-  <div style="padding: 0 10px;">
+  <div class="eml2pdf-message-body" style="padding: 0 10px;">
     ${msg.html}
     ${attachmentListHtml(msg.attachments)}
   </div>
@@ -321,6 +322,7 @@ function buildThreadHtml(messages, timezone) {
   img { max-width: 100%; height: auto; }
   table { border-collapse: collapse; }
   td, th { padding: 4px 8px; }
+${EMAIL_RENDER_DEFENSIVE_CSS}
 </style>
 </head>
 <body>

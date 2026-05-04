@@ -69,6 +69,13 @@ async function buildBoth(emlBuf) {
   return { md, metadata, usedCids };
 }
 
+async function buildBody(emlBuf) {
+  const mail = await simpleParser(emlBuf);
+  const warnings = [];
+  const { body } = buildHtmlForTest(mail, 'UTC', warnings);
+  return { body, warnings };
+}
+
 // 1. YAML frontmatter + H1 + simple body.
 {
   const { md } = await buildBoth(eml(`<p>Hello <b>world</b>.</p>`));
@@ -236,6 +243,21 @@ Content-Type: text/plain
     inlineImagesResolved: 0, attachments: [], warnings: [],
   });
   check('empty body doesn\'t crash', typeof md === 'string' && md.length > 0, { md });
+}
+
+// 9. Outlook Web App loader overlays are stripped so they cannot blank PDFs.
+{
+  const { body } = await buildBody(eml(`
+    <style>
+      #loadingScreen { position: fixed; inset: 0; background-color: #fff; }
+    </style>
+    <div id="loadingScreen"><div id="loadingLogo"><img id="MSLogo"></div></div>
+    <p>Visible message body</p>
+  `));
+  check('OWA loadingScreen node stripped', !/id=["']loadingScreen["']/i.test(body), { body });
+  check('OWA loadingLogo node stripped', !/id=["']loadingLogo["']/i.test(body), { body });
+  check('OWA MSLogo node stripped', !/id=["']MSLogo["']/i.test(body), { body });
+  check('OWA message content preserved', body.includes('Visible message body'), { body });
 }
 
 if (fail) {
