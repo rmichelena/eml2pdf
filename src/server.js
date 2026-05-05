@@ -30,6 +30,59 @@ const clamp = (v, lo, hi, def) => {
   return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : def;
 };
 
+const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
+
+function parseCommonOptions(options = {}, defaults = {}) {
+  const {
+    defaultOutputs = ['pdf'],
+    maxHeightDefault = DEFAULT_MAX_HEIGHT_PX,
+    maxHeightMax = HEIGHT_MAX,
+    timeoutDefault = CONVERSION_TIMEOUT_MS,
+    timeoutMax = TIMEOUT_MAX,
+    endpointLabel = 'options',
+  } = defaults;
+
+  let outputs = defaultOutputs;
+  if (options.outputs !== undefined) {
+    if (!Array.isArray(options.outputs)) {
+      throw Object.assign(
+        new Error(`${endpointLabel}.outputs must be an array of strings ("pdf", "markdown")`),
+        { status: 400 }
+      );
+    }
+    if (options.outputs.length === 0) {
+      throw Object.assign(new Error(`${endpointLabel}.outputs cannot be empty`), { status: 400 });
+    }
+    const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
+    for (const o of normalized) {
+      if (!ALLOWED_OUTPUTS.has(o)) {
+        throw Object.assign(
+          new Error(`Invalid output format "${o}". Allowed: pdf, markdown`),
+          { status: 400 }
+        );
+      }
+    }
+    outputs = normalized;
+  }
+
+  const clientWantsRemote = options.loadRemoteImages !== false;
+  const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
+  const remoteDisabledReason = loadRemoteImages
+    ? null
+    : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
+
+  return {
+    timezone: typeof options.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
+    outputs,
+    widthPx: clamp(options.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
+    maxHeightPx: clamp(options.maxHeightPx, HEIGHT_MIN, maxHeightMax, maxHeightDefault),
+    loadRemoteImages,
+    remoteDisabledReason,
+    timeout: clamp(options.timeout, TIMEOUT_MIN, timeoutMax, timeoutDefault),
+    needsRenderSlot: outputs.includes('pdf'),
+  };
+}
+
 // Render-slot semaphore with byte-bounded backlog.
 // We hold the eml buffer in memory while queued, so bound the total queued bytes,
 // not just the slot count. Requests that fit in the queue wait (good for n8n);
@@ -162,47 +215,12 @@ async function handleConvert(req, res, requestId) {
       messageId = messageId.replace(/[\x00-\x1f]/g, '').slice(0, 998);
     }
 
-    // Env acts as a ceiling: client cannot ELEVATE remote-image loading above
-    // the operator setting. Track WHY remote was disabled so the warning we
-    // emit later is actionable (env vs client choice).
-    const clientWantsRemote = options?.loadRemoteImages !== false;
-    const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
-    const remoteDisabledReason = loadRemoteImages
-      ? null
-      : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
-
-    // outputs: array of formats to produce. Default ['pdf'] for backward
-    // compatibility. Validate here (not just in convertEmail) so we know
-    // upfront whether we need a render slot — markdown-only conversions
-    // skip Chromium and therefore don't need to wait in the render queue.
-    const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
-    let requestedOutputs = ['pdf'];
-    if (options?.outputs !== undefined) {
-      if (!Array.isArray(options.outputs)) {
-        return jsonError(res, 400, 'options.outputs must be an array of strings ("pdf", "markdown")');
-      }
-      if (options.outputs.length === 0) {
-        return jsonError(res, 400, 'options.outputs cannot be empty');
-      }
-      const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
-      for (const o of normalized) {
-        if (!ALLOWED_OUTPUTS.has(o)) {
-          return jsonError(res, 400, `Invalid output format "${o}". Allowed: pdf, markdown`);
-        }
-      }
-      requestedOutputs = normalized;
-    }
-    const needsRenderSlot = requestedOutputs.includes('pdf');
-
-    const opts = {
-      widthPx: clamp(options?.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
-      maxHeightPx: clamp(options?.maxHeightPx, HEIGHT_MIN, HEIGHT_MAX, DEFAULT_MAX_HEIGHT_PX),
-      loadRemoteImages,
-      remoteDisabledReason,
-      timeout: clamp(options?.timeout, TIMEOUT_MIN, TIMEOUT_MAX, CONVERSION_TIMEOUT_MS),
-      timezone: typeof options?.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
-      outputs: requestedOutputs,
-    };
+    // Parse common client options in one place so /convert and /convert-thread
+    // cannot drift when we add outputs, remote-image policy, or render bounds.
+    const { needsRenderSlot, ...opts } = parseCommonOptions(options || {}, {
+      defaultOutputs: ['pdf'],
+      endpointLabel: 'options',
+    });
 
     // Only acquire the render-slot semaphore for conversions that actually
     // need Chromium. Markdown-only is parse + sanitize + turndown — light
@@ -286,24 +304,15 @@ async function handleConvertThread(req, res, requestId) {
 
     const options = body.options || {};
 
-    // outputs validation
-    const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
-    let requestedOutputs = ['pdf', 'markdown']; // default for thread: both
-    if (options.outputs !== undefined) {
-      if (!Array.isArray(options.outputs)) {
-        return jsonError(res, 400, 'options.outputs must be an array of strings');
-      }
-      if (options.outputs.length === 0) {
-        return jsonError(res, 400, 'options.outputs cannot be empty');
-      }
-      const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
-      for (const o of normalized) {
-        if (!ALLOWED_OUTPUTS.has(o)) {
-          return jsonError(res, 400, `Invalid output format "${o}". Allowed: pdf, markdown`);
-        }
-      }
-      requestedOutputs = normalized;
-    }
+    const commonOptions = parseCommonOptions(options, {
+      defaultOutputs: ['pdf', 'markdown'],
+      maxHeightDefault: DEFAULT_MAX_HEIGHT_PX * 2,
+      timeoutDefault: CONVERSION_TIMEOUT_MS * 2,
+      timeoutMax: TIMEOUT_MAX * 2,
+      endpointLabel: 'options',
+    });
+    const requestedOutputs = commonOptions.outputs;
+    const needsRenderSlot = commonOptions.needsRenderSlot;
 
     // quoteMode validation
     let quoteMode = 'preserve';
@@ -314,25 +323,12 @@ async function handleConvertThread(req, res, requestId) {
       }
     }
 
-    const clientWantsRemote = options.loadRemoteImages !== false;
-    const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
-    const remoteDisabledReason = loadRemoteImages
-      ? null
-      : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
-
+    const { needsRenderSlot: _needsRenderSlot, ...optsBase } = commonOptions;
     const opts = {
+      ...optsBase,
       threadId: body.threadId ? sanitizeFilename(String(body.threadId)) : undefined,
-      timezone: typeof options.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
-      outputs: requestedOutputs,
       quoteMode,
-      widthPx: clamp(options.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
-      maxHeightPx: clamp(options.maxHeightPx, HEIGHT_MIN, HEIGHT_MAX, DEFAULT_MAX_HEIGHT_PX * 2),
-      loadRemoteImages,
-      remoteDisabledReason,
-      timeout: clamp(options.timeout, TIMEOUT_MIN, TIMEOUT_MAX * 2, CONVERSION_TIMEOUT_MS * 2),
     };
-
-    const needsRenderSlot = requestedOutputs.includes('pdf');
 
     // Calculate total payload bytes for queue accounting
     const totalBytes = body.messages.reduce((sum, m) => {
