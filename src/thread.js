@@ -22,6 +22,8 @@ import {
   filterRemoteUrlsForTest as filterRemoteUrls,
   EMAIL_RENDER_CSP,
   EMAIL_RENDER_DEFENSIVE_CSS,
+  EMAIL_ALLOWED_TAGS,
+  EMAIL_ALLOWED_ATTRS,
   formatDisplayDate,
   resolveCidImages,
   extractCidRefs,
@@ -34,9 +36,22 @@ import {
 
 // ─── Quote stripping ─────────────────────────────────────────────────
 
-// Separators Gmail/Outlook/etc. insert before quoted text
-const QUOTE_SEPARATOR_RE =
-  /^\s*(?:On .{1,120}? wrote\s*:|El .{1,120}? escribi[oó]\s*:|-----Original Message-----)/i;
+// Separators Gmail/Outlook/etc. insert before quoted text. Shared by HTML
+// and text/plain stripping so language coverage stays consistent.
+const QUOTE_SEPARATOR_PATTERNS = [
+  /^On .{1,120}? wrote\s*:\s*$/i,                    // English
+  /^El .{1,120}? escribi[oó]\s*:\s*$/i,              // Spanish
+  /^Le .{1,120}? a écrit\s*:\s*$/i,                  // French
+  /^Am .{1,120}? schrieb\s*:?\s*$/i,                 // German
+  /^.{1,120}? ha scritto\s*:\s*$/i,                  // Italian
+  /^.{1,120}? escreveu\s*:\s*$/i,                    // Portuguese
+  /^-{3,}\s*Original Message\s*-{3,}\s*$/i,          // Outlook EN
+  /^-{3,}\s*Mensaje original\s*-{3,}\s*$/i,          // Outlook ES
+];
+
+function isQuoteSeparatorLine(line) {
+  return QUOTE_SEPARATOR_PATTERNS.some(pat => pat.test(String(line || '').trim()));
+}
 
 /**
  * Strip quoted blocks from HTML body using DOM-aware parsing.
@@ -61,8 +76,8 @@ export function stripQuotesHtml(html) {
   // sanitize-html's exclusiveFilter removes the matched element and its
   // descendants while preserving legitimate siblings between quote blocks.
   result = sanitizeHtml(result, {
-    allowedTags: false,
-    allowedAttributes: false,
+    allowedTags: EMAIL_ALLOWED_TAGS,
+    allowedAttributes: { '*': EMAIL_ALLOWED_ATTRS },
     allowVulnerableTags: true,
     exclusiveFilter(frame) {
       const tag = String(frame.tag || '').toLowerCase();
@@ -87,22 +102,11 @@ export function stripQuotesHtml(html) {
   //
   // The `^` anchor + multiline flag ensures we only match separator text that
   // occupies its own block element, not embedded in running paragraph text.
-  const separatorPatterns = [
-    /^On .{1,120}? wrote\s*:\s*$/im,                    // English
-    /^El .{1,120}? escribi[oó]\s*:\s*$/im,              // Spanish
-    /^Le .{1,120}? a écrit\s*:\s*$/im,                  // French
-    /^Am .{1,120}? schrieb\s*:?\s*$/im,                 // German
-    /^.{1,120}? ha scritto\s*:\s*$/im,                  // Italian
-    /^.{1,120}? escreveu\s*:\s*$/im,                    // Portuguese
-    /^-{3,}\s*Original Message\s*-{3,}\s*$/im,          // Outlook EN
-    /^-{3,}\s*Mensaje original\s*-{3,}\s*$/im,          // Outlook ES
-  ];
-
   const plainText = result
     .replace(/<\/(?:div|p|blockquote|section|article|aside|header|footer|main)>/gi, '\n')
     .replace(/<[^>]+>/g, '');
 
-  for (const pat of separatorPatterns) {
+  for (const pat of QUOTE_SEPARATOR_PATTERNS.map(p => new RegExp(p.source, 'im'))) {
     const m = plainText.match(pat);
     if (!m) continue;
 
@@ -165,7 +169,7 @@ export function stripQuotesText(text) {
   let inQuoteBlock = false;
 
   for (const line of lines) {
-    if (QUOTE_SEPARATOR_RE.test(line)) {
+    if (isQuoteSeparatorLine(line)) {
       inQuoteBlock = true;
       continue;
     }
@@ -513,12 +517,17 @@ export async function convertThread(rawMessages, opts = {}) {
     // P1 fix: Gmail returns internalDate as epoch-ms string (e.g. "1745856000000").
     // Must parse as Number; new Date(string) only handles ISO date strings.
     let date;
-    if (raw.internalDate != null) {
+    if (raw.internalDate != null && String(raw.internalDate).trim() !== '') {
       const ms = Number(raw.internalDate);
-      date = Number.isFinite(ms) ? new Date(ms) : null;
+      date = Number.isFinite(ms) && ms > 0 ? new Date(ms) : null;
     }
     if (!date || !Number.isFinite(date.getTime())) {
-      date = mail.date || new Date();
+      if (mail.date && Number.isFinite(mail.date.getTime())) {
+        date = mail.date;
+      } else {
+        warnings.push(`messages[${i}] has no parseable date; sorting first`);
+        date = new Date(0);
+      }
     }
     const subject = mail.subject || '';
     const from = mail.from?.text || '';

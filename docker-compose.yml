@@ -4,12 +4,14 @@ services:
     container_name: eml2pdf
     restart: unless-stopped
     ports:
-      # Bind to loopback by default — front it with a reverse proxy / n8n on the same network.
+      # Public bind is intentional for the current n8n/side-by-side test setup.
+      # For production, prefer 127.0.0.1:3005:3000 behind a proxy, or set API_KEY.
       - "3005:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
       - MAX_REQUEST_MB=200
+      - MAX_MESSAGE_DECODED_BYTES=50000000
       - DEFAULT_WIDTH_PX=900
       - DEFAULT_MAX_HEIGHT_PX=30000
       # Remote images on by default for fidelity with marketing/signature

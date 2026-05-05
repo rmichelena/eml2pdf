@@ -17,6 +17,7 @@ const MAX_QUEUED_EML_MB = parseInt(process.env.MAX_QUEUED_EML_MB || '500', 10);
 const MAX_QUEUED_EML_BYTES = MAX_QUEUED_EML_MB * 1024 * 1024;
 const MAX_QUEUE_WAIT_MS = parseInt(process.env.MAX_QUEUE_WAIT_MS || '180000', 10);
 const MAX_THREAD_MESSAGES = parseInt(process.env.MAX_THREAD_MESSAGES || '200', 10);
+const MAX_MESSAGE_DECODED_BYTES = parseInt(process.env.MAX_MESSAGE_DECODED_BYTES || '50000000', 10);
 const API_KEY = process.env.API_KEY || '';
 
 // Bounds for client-supplied options (DoS protection)
@@ -152,6 +153,9 @@ async function handleConvert(req, res, requestId) {
       } catch (e) {
         return jsonError(res, 400, 'Invalid base64 payload');
       }
+      if (emlBuf.length > MAX_MESSAGE_DECODED_BYTES) {
+        return jsonError(res, 413, `decoded message size (${emlBuf.length}) exceeds MAX_MESSAGE_DECODED_BYTES (${MAX_MESSAGE_DECODED_BYTES})`);
+      }
     }
 
     if (typeof messageId === 'string') {
@@ -272,6 +276,11 @@ async function handleConvertThread(req, res, requestId) {
       const msg = body.messages[i];
       if (!msg.rawBase64Url && !msg.emlBase64) {
         return jsonError(res, 400, `messages[${i}] must have rawBase64Url or emlBase64`);
+      }
+      const raw = msg.rawBase64Url || msg.emlBase64 || '';
+      const decodedBytesApprox = Math.ceil(String(raw).replace(/\s+/g, '').length * 0.75);
+      if (decodedBytesApprox > MAX_MESSAGE_DECODED_BYTES) {
+        return jsonError(res, 413, `messages[${i}] decoded size (${decodedBytesApprox}) exceeds MAX_MESSAGE_DECODED_BYTES (${MAX_MESSAGE_DECODED_BYTES})`);
       }
     }
 

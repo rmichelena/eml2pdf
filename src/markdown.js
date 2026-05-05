@@ -1,20 +1,7 @@
 import { getTurndownService, mdEscapeInline, formatBytes, normalizeResidualHtml } from './textutil.js';
 
-let _service = null;
-
-function service() {
-  if (_service) return _service;
-  const td = getTurndownService();
-  td.addRule('drop-eml2pdf-wrapper', {
-    filter: (node) => node.id === 'eml2pdf-email-body',
-    replacement: (content) => content,
-  });
-  _service = td;
-  return _service;
-}
-
 export function buildMarkdown(mail, bodyWithImages, metadata) {
-  const td = service();
+  const td = getTurndownService();
   const lines = [];
 
   const frontmatter = {
@@ -30,6 +17,9 @@ export function buildMarkdown(mail, bodyWithImages, metadata) {
     v !== null && v !== undefined && !(Array.isArray(v) && v.length === 0)
   );
   lines.push('---');
+  // Use JSON.stringify for YAML-ish frontmatter values. It safely quotes
+  // hostile email metadata containing `:`, newlines, `---`, brackets, etc.;
+  // consumers still get valid scalar/array values without Markdown injection.
   for (const [k, v] of fmEntries) lines.push(`${k}: ${JSON.stringify(v)}`);
   lines.push('---');
   lines.push('');

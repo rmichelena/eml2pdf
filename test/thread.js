@@ -162,6 +162,13 @@ function listZip(buf) {
   finally { try { execSync(`rm -f ${tmpZip}`); } catch {} }
 }
 
+function extractJson(buf) {
+  const tmpZip = `/tmp/test-thread-json-${Date.now()}-${Math.random().toString(36).slice(2)}.zip`;
+  writeFileSync(tmpZip, buf);
+  try { return JSON.parse(execSync(`unzip -p ${tmpZip} '*thread.json'`).toString()); }
+  finally { try { execSync(`rm -f ${tmpZip}`); } catch {} }
+}
+
 // 9. quoteMode strip resolves CIDs after quote removal and does not emit
 // images that only existed in the stripped quote as attachments.
 {
@@ -278,7 +285,59 @@ function listZip(buf) {
   }
 }
 
-// 14. threadId is sanitized before JSON metadata
+// 14. text/plain quoteMode strip recognizes non-EN/ES separators too
+{
+  const msg = buildTextEml({
+    from: 'A <a@a.it>', to: 'B <b@b.it>', subject: 'Plain IT',
+    date: 'Mon, 28 Apr 2025 10:00:00 +0200',
+    body: 'Risposta fresca\n\nBob ha scritto:\nVecchio contenuto',
+  });
+
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg }],
+    options: { outputs: ['markdown'], quoteMode: 'strip' },
+  });
+  assertEqual(res.status, 200, 'text/plain IT strip: 200');
+  if (res.ok) {
+    const md = extractMd(Buffer.from(await res.arrayBuffer()));
+    assert(md.includes('Risposta fresca'), 'text/plain IT strip: reply preserved');
+    assert(!md.includes('Vecchio contenuto'), 'text/plain IT strip: quoted content removed');
+  }
+}
+
+// 15. empty internalDate does not become Unix epoch when Date header exists
+{
+  const msg = buildEml({ from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Date header', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: '<p>Hi</p>' });
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: msg, internalDate: '' }],
+    options: { outputs: ['markdown'] },
+  });
+  assertEqual(res.status, 200, 'empty internalDate: 200');
+  if (res.ok) {
+    const json = extractJson(Buffer.from(await res.arrayBuffer()));
+    assert(json.messages[0].date.startsWith('2025-04-28'), 'empty internalDate: Date header used');
+    assert(!json.messages[0].date.startsWith('1970-01-01'), 'empty internalDate: not epoch');
+  }
+}
+
+// 16. missing/unparseable dates sort first and warn instead of using run-time now
+{
+  const noDate = Buffer.from('From: A <a@a.com>\nTo: B <b@b.com>\nSubject: No date\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8\n\n<p>No date</p>').toString('base64url');
+  const dated = buildEml({ from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Dated', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: '<p>Dated</p>' });
+  const res = await post('/convert-thread', {
+    messages: [{ rawBase64Url: dated }, { rawBase64Url: noDate }],
+    options: { outputs: ['markdown'] },
+  });
+  assertEqual(res.status, 200, 'missing date sort: 200');
+  if (res.ok) {
+    const json = extractJson(Buffer.from(await res.arrayBuffer()));
+    assert(json.messages[0].subject === 'No date', 'missing date sort: no-date message first');
+    assert(json.messages[0].date === '1970-01-01T00:00:00.000Z', 'missing date sort: stable epoch fallback');
+    assert(json.warnings.some(w => /no parseable date/.test(w)), 'missing date sort: warning emitted');
+  }
+}
+
+// 17. threadId is sanitized before JSON metadata
 {
   const msg = buildEml({ from: 'A <a@a.com>', to: 'B <b@b.com>', subject: 'Thread id', date: 'Mon, 28 Apr 2025 10:00:00 +0200', body: '<p>Hi</p>' });
   const res = await post('/convert-thread', {

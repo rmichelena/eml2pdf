@@ -27,12 +27,20 @@ export function getTurndownService() {
     filter: 'br',
     replacement: () => '\n',
   });
+  td.addRule('drop-eml2pdf-wrapper', {
+    filter: (node) => node.id === 'eml2pdf-email-body',
+    replacement: (content) => content,
+  });
 
   _turndown = td;
   return td;
 }
 
 export function mdEscapeInline(s) {
+  // Markdown output is consumed by humans and downstream LLM pipelines. Treat
+  // email metadata/body text as hostile: escape inline metacharacters so a
+  // crafted Subject/From cannot inject headings, links, blockquotes, tables,
+  // or emphasis into generated Markdown structure.
   return String(s)
     .replace(/[\r\n]+/g, ' ')
     .replace(/[\\`*_{}\[\]()#+\-!|>]/g, (c) => `\\${c}`)
