@@ -18,6 +18,7 @@ const MAX_QUEUED_EML_BYTES = MAX_QUEUED_EML_MB * 1024 * 1024;
 const MAX_QUEUE_WAIT_MS = parseInt(process.env.MAX_QUEUE_WAIT_MS || '180000', 10);
 const MAX_THREAD_MESSAGES = parseInt(process.env.MAX_THREAD_MESSAGES || '200', 10);
 const MAX_MESSAGE_DECODED_BYTES = parseInt(process.env.MAX_MESSAGE_DECODED_BYTES || '50000000', 10);
+const MAX_TOTAL_THREAD_BYTES = parseInt(process.env.MAX_TOTAL_THREAD_BYTES || '524288000', 10); // 500MB default
 const API_KEY = process.env.API_KEY || '';
 
 // Bounds for client-supplied options (DoS protection)
@@ -289,7 +290,8 @@ async function handleConvertThread(req, res, requestId) {
       return jsonError(res, 413, `Too many messages (${body.messages.length}). Limit: ${MAX_THREAD_MESSAGES}`);
     }
 
-    // Validate each message has raw payload
+    // Validate each message has raw payload and track cumulative decoded size
+    let totalDecodedBytes = 0;
     for (let i = 0; i < body.messages.length; i++) {
       const msg = body.messages[i];
       if (!msg.rawBase64Url && !msg.emlBase64) {
@@ -300,6 +302,11 @@ async function handleConvertThread(req, res, requestId) {
       if (decodedBytesApprox > MAX_MESSAGE_DECODED_BYTES) {
         return jsonError(res, 413, `messages[${i}] decoded size (${decodedBytesApprox}) exceeds MAX_MESSAGE_DECODED_BYTES (${MAX_MESSAGE_DECODED_BYTES})`);
       }
+      totalDecodedBytes += decodedBytesApprox;
+    }
+
+    if (totalDecodedBytes > MAX_TOTAL_THREAD_BYTES) {
+      return jsonError(res, 413, `Total decoded size (${totalDecodedBytes}) exceeds MAX_TOTAL_THREAD_BYTES (${MAX_TOTAL_THREAD_BYTES})`);
     }
 
     const options = body.options || {};
@@ -411,6 +418,7 @@ function readJsonBody(req, maxBytes) {
     const safeReject = (e) => {
       if (settled) return;
       settled = true;
+      try { req.destroy(); } catch {}
       reject(e);
     };
     const safeResolve = (v) => {
@@ -449,7 +457,8 @@ function jsonError(res, status, message) {
 }
 
 server.listen(PORT, () => {
-  console.log(`mail-to-pdf listening on :${PORT} (max ${MAX_REQUEST_MB}MB/req, concurrency ${MAX_CONCURRENT_RENDERS}, queue ${MAX_QUEUED_EML_MB}MB/${MAX_QUEUE_WAIT_MS}ms, auth ${API_KEY ? 'on' : 'off'})`);
+  const authWarning = !API_KEY ? ' ⚠️  No API_KEY set — service is unauthenticated' : '';
+  console.log(`mail-to-pdf listening on :${PORT} (max ${MAX_REQUEST_MB}MB/req, concurrency ${MAX_CONCURRENT_RENDERS}, queue ${MAX_QUEUED_EML_MB}MB/${MAX_QUEUE_WAIT_MS}ms, auth ${API_KEY ? 'on' : 'off'})${authWarning}`);
 });
 
 let shuttingDown = false;

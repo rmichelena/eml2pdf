@@ -198,17 +198,12 @@ function putCachedRemote(url, entry) {
   remoteResourceCache.set(url, cached);
   remoteResourceCacheBytes += cached.bytes;
 
+  // FIFO eviction: Map iterates in insertion order, so the first entry is
+  // the oldest. No linear scan needed.
   while (remoteResourceCacheBytes > REMOTE_CACHE_MAX_BYTES && remoteResourceCache.size > 0) {
-    let oldestUrl = null;
-    let oldestUsed = Infinity;
-    for (const [u, e] of remoteResourceCache) {
-      if (e.lastUsed < oldestUsed) {
-        oldestUsed = e.lastUsed;
-        oldestUrl = u;
-      }
-    }
-    const old = remoteResourceCache.get(oldestUrl);
-    remoteResourceCache.delete(oldestUrl);
+    const firstKey = remoteResourceCache.keys().next().value;
+    const old = remoteResourceCache.get(firstKey);
+    remoteResourceCache.delete(firstKey);
     remoteResourceCacheBytes -= old.bytes;
   }
 }
@@ -711,14 +706,17 @@ function attachmentIcon(contentType = '', filename = '') {
   return '📎';
 }
 
-function attachmentListHtml(attachments = []) {
+function attachmentListHtml(attachments = [], useMappedName = false) {
   if (!attachments.length) return '';
-  const rows = attachments.map(att => `
+  const rows = attachments.map(att => {
+    const displayName = (useMappedName && att._finalFilename) ? att._finalFilename : (att.filename || 'attachment');
+    return `
     <li style="margin:4px 0;">
-      <span style="font-size:14px;margin-right:6px;">${attachmentIcon(att.contentType, att.filename)}</span>
-      <strong>${esc(att.filename || 'attachment')}</strong>
+      <span style="font-size:14px;margin-right:6px;">${attachmentIcon(att.contentType, displayName)}</span>
+      <strong>${esc(displayName)}</strong>
       <span style="color:#666;"> — ${esc(att.contentType || 'application/octet-stream')}${typeof att.size === 'number' ? ` · ${esc(formatBytesLocal(att.size))}` : ''}</span>
-    </li>`).join('');
+    </li>`;
+  }).join('');
   return `
     <div style="margin-top:16px;padding-top:10px;border-top:1px solid #ddd;font-family:Arial,sans-serif;font-size:10.5pt;line-height:1.35;break-inside:avoid;page-break-inside:avoid;">
       <div style="font-weight:bold;margin-bottom:6px;">Adjuntos (${attachments.length})</div>

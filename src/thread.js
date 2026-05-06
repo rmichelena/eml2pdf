@@ -39,12 +39,12 @@ import {
 // Separators Gmail/Outlook/etc. insert before quoted text. Shared by HTML
 // and text/plain stripping so language coverage stays consistent.
 const QUOTE_SEPARATOR_PATTERNS = [
-  /^On .{1,120}? wrote\s*:\s*$/i,                    // English
-  /^El .{1,120}? escribi[oó]\s*:\s*$/i,              // Spanish
-  /^Le .{1,120}? a écrit\s*:\s*$/i,                  // French
-  /^Am .{1,120}? schrieb\s*:?\s*$/i,                 // German
-  /^.{1,120}? ha scritto\s*:\s*$/i,                  // Italian
-  /^.{1,120}? escreveu\s*:\s*$/i,                    // Portuguese
+  /^On .{1,120}? (?:wrote|schrieb|escribi[oó]|a écrit|ha scritto|escreveu)\s*:\s*$/i,  // English/German/Spanish/French/Italian/Portuguese
+  /^El .{1,120}? escribi[oó]\s*:\s*$/i,              // Spanish (redundant but explicit anchor)
+  /^Le .{1,120}? a écrit\s*:\s*$/i,                  // French (explicit anchor)
+  /^Am .{1,120}? schrieb\s*:?\s*$/i,                 // German (explicit anchor)
+  /^Il .{1,120}? ha scritto\s*:\s*$/i,              // Italian (anchored with "Il ")
+  /^Em .{1,120}? escreveu\s*:\s*$/i,                // Portuguese (anchored with "Em ")
   /^-{3,}\s*Original Message\s*-{3,}\s*$/i,          // Outlook EN
   /^-{3,}\s*Mensaje original\s*-{3,}\s*$/i,          // Outlook ES
 ];
@@ -203,13 +203,7 @@ function dedupAttachments(allAttachments) {
   const representatives = [];
   for (const [, entries] of byHash) {
     entries.sort((a, b) => (a.att._msgDate || 0) - (b.att._msgDate || 0));
-    const canonical = entries[entries.length - 1].att; // newest message wins naming/version semantics
-    for (const { att } of entries) {
-      if (att !== canonical) {
-        att._duplicateOfSha256 = canonical.sha256 || att.sha256;
-        att.filename = canonical.filename;
-      }
-    }
+    const canonical = entries[entries.length - 1].att;
     representatives.push({ att: canonical, entries });
   }
 
@@ -222,10 +216,8 @@ function dedupAttachments(allAttachments) {
     groups.get(filename).push({ rep, index: i });
   }
 
-  const result = new Array(representatives.length).fill(null);
-  // Track all emitted filenames to guarantee global uniqueness.
-  // This catches collisions where a date-stamped name accidentally
-  // matches an unrelated original filename.
+  // Build name mapping: original filename → final filename for each attachment
+  const nameMap = new Map(); // att reference → final filename
   const emitted = new Set();
 
   function uniqueName(candidate) {
@@ -233,7 +225,6 @@ function dedupAttachments(allAttachments) {
       emitted.add(candidate);
       return candidate;
     }
-    // Collision — append numeric suffix until unique
     const dot = candidate.lastIndexOf('.');
     const ext = dot > 0 ? candidate.slice(dot) : '';
     const base = dot > 0 ? candidate.slice(0, dot) : candidate;
@@ -248,44 +239,62 @@ function dedupAttachments(allAttachments) {
     if (entries.length === 1) {
       const att = entries[0].rep.att;
       const finalName = uniqueName(att.filename);
-      for (const { att: linked } of entries[0].rep.entries) linked.filename = finalName;
-      cleanupDedupFields(att);
-      result[entries[0].index] = att;
+      nameMap.set(att, finalName);
+      for (const { att: linked } of entries[0].rep.entries) {
+        if (linked !== att) nameMap.set(linked, finalName);
+      }
       continue;
     }
 
-    // Sort by message date ascending (oldest first)
     entries.sort((a, b) => (a.rep.att._msgDate || 0) - (b.rep.att._msgDate || 0));
 
-    // Process oldest first — they get date-stamped names.
-    // The newest (last) keeps the original name.
     for (let j = 0; j < entries.length; j++) {
       const att = entries[j].rep.att;
       let finalName;
       if (j < entries.length - 1) {
-        // Rename with date suffix
         const dot = att.filename.lastIndexOf('.');
         const ext = dot > 0 ? att.filename.slice(dot) : '';
         const base = dot > 0 ? att.filename.slice(0, dot) : att.filename;
         const dateSuffix = att._msgDateStr || String(j + 1);
         finalName = uniqueName(`${base}_${dateSuffix}${ext}`);
       } else {
-        // Newest keeps original name (but still dedup-checked)
         finalName = uniqueName(att.filename);
       }
-      for (const { att: linked } of entries[j].rep.entries) linked.filename = finalName;
-      cleanupDedupFields(att);
-      result[entries[j].index] = att;
+      nameMap.set(att, finalName);
+      for (const { att: linked } of entries[j].rep.entries) {
+        if (linked !== att) nameMap.set(linked, finalName);
+      }
+    }
+  }
+
+  // Build final attachments from representatives only (no mutation of originals).
+  // Clone content buffers to avoid sharing references with parsedMessages.
+  const result = new Array(representatives.length).fill(null);
+  for (let i = 0; i < representatives.length; i++) {
+    const att = representatives[i].att;
+    const finalName = nameMap.get(att) || att.filename;
+    result[i] = {
+      filename: finalName,
+      contentType: att.contentType || 'application/octet-stream',
+      content: Buffer.from(att.content), // clone to avoid shared reference
+      size: att.size || att.content?.length || 0,
+      sha256: att.sha256,
+    };
+  }
+
+  // Apply filename mapping to per-message attachment metadata (the light
+  // objects used in threadMeta and buildThreadHtml) without mutating the
+  // original attachment objects from parsedMessages.
+  for (const att of allAttachments) {
+    const mapped = nameMap.get(att);
+    if (mapped) att._finalFilename = mapped;
+    // Free content on non-representative attachments to release memory early
+    if (!representatives.some(r => r.att === att)) {
+      att.content = null;
     }
   }
 
   return result.filter(Boolean);
-}
-
-function cleanupDedupFields(att) {
-  delete att._msgDate;
-  delete att._msgDateStr;
-  delete att._duplicateOfSha256;
 }
 
 // ─── Thread HTML builder (for PDF) ────────────────────────────────────
@@ -312,7 +321,7 @@ function buildThreadHtml(messages, timezone) {
   </div>
   <div class="eml2pdf-message-body" style="padding: 0 10px;">
     ${msg.html}
-    ${attachmentListHtml(msg.attachments)}
+    ${attachmentListHtml(msg.attachments, true)}
   </div>
 </div>`);
   }
@@ -388,7 +397,7 @@ function buildThreadMarkdown(messages, threadMeta, timezone) {
 
     if (msg.attachments.length) {
       lines.push('');
-      lines.push(`**Attachments:** ${msg.attachments.map(a => `\`${a.filename.replace(/`/g, "'")}\``).join(', ')}`);
+      lines.push(`**Attachments:** ${msg.attachments.map(a => `\`${(a._finalFilename || a.filename).replace(/`/g, "'")}\``).join(', ')}`);
     }
     lines.push('');
   }
@@ -586,7 +595,7 @@ export async function convertThread(rawMessages, opts = {}) {
       cc: m.cc,
       date: m.date.toISOString(),
       attachments: m.attachments.map(a => ({
-        filename: a.filename,
+        filename: a._finalFilename || a.filename,
         contentType: a.contentType,
         size: a.size,
         sha256: a.sha256,

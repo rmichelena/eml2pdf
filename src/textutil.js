@@ -178,10 +178,10 @@ function decodeHtmlEntities(s) {
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&#(\d+);/g, (_, n) => {
       const code = Number(n);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+      return (Number.isFinite(code) && code >= 0 && code <= 0x10FFFF) ? String.fromCodePoint(code) : _;
     })
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
       const code = parseInt(n, 16);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+      return (Number.isFinite(code) && code >= 0 && code <= 0x10FFFF) ? String.fromCodePoint(code) : _;
     });
 }
