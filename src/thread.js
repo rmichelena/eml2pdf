@@ -150,7 +150,7 @@ export function stripQuotesHtml(html) {
       }
     }
 
-    if (lastBlockOpen >= 0 && lastBlockOpen < result.length - 10) {
+    if (lastBlockOpen >= 0 && lastBlockOpen > result.length * 0.1) {
       result = result.slice(0, lastBlockOpen);
     }
     break;
@@ -282,14 +282,20 @@ function dedupAttachments(allAttachments) {
     };
   }
 
+  // Build a WeakSet of representative attachments for O(1) lookup
+  const repSet = new WeakSet(representatives.map(r => r.att));
+
   // Apply filename mapping to per-message attachment metadata (the light
   // objects used in threadMeta and buildThreadHtml) without mutating the
   // original attachment objects from parsedMessages.
+  // Non-representative attachment .content is nulled to release memory early.
+  // This is intentional: finalAttachments owns cloned buffers, and
+  // parsedMessages[i].attachments is only used for metadata (filename,
+  // contentType, size) in threadMeta and HTML rendering.
   for (const att of allAttachments) {
     const mapped = nameMap.get(att);
     if (mapped) att._finalFilename = mapped;
-    // Free content on non-representative attachments to release memory early
-    if (!representatives.some(r => r.att === att)) {
+    if (!repSet.has(att)) {
       att.content = null;
     }
   }

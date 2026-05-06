@@ -85,12 +85,14 @@ export function formatDateSuffix(date, timezone) {
 export function normalizeResidualHtml(md) {
   if (!md || !/<[a-z][\s\S]*>/i.test(md)) return md || '';
   return replaceBalancedTableBlocks(String(md))
-    .replace(/<div\b[\s\S]*?<\/div>/gi, (html) => {
-      // Only touch div blocks that still contain nested HTML tags. Plain text
-      // with angle brackets should be left alone.
-      return /<\/?(?:table|tbody|tr|td|span|font|img|a|br)\b/i.test(html)
-        ? htmlBlockToText(html)
-        : html;
+    .replace(/<div\b[^>]*>([\s\S]*?)<\/div>/gi, function replaceDivs(_, inner) {
+      // Recursively handle nested <div> elements from inside out.
+      const processed = inner.replace(/<div\b[^>]*>([\s\S]*?)<\/div>/gi, replaceDivs);
+      // Only convert to text if there are still HTML tags inside
+      if (/<\/(?:table|tbody|tr|td|span|font|img|a|br)\b/i.test(processed)) {
+        return htmlBlockToText(`<div>${processed}</div>`);
+      }
+      return `<div>${processed}</div>`;
     })
     .replace(/\n{3,}/g, '\n\n')
     .trim();

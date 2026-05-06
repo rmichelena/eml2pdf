@@ -179,6 +179,9 @@ function getCachedRemote(url) {
     return null;
   }
   entry.lastUsed = Date.now();
+  // Move to end of Map iteration order for true LRU eviction
+  remoteResourceCache.delete(url);
+  remoteResourceCache.set(url, entry);
   return entry;
 }
 
@@ -206,6 +209,21 @@ function putCachedRemote(url, entry) {
     remoteResourceCache.delete(firstKey);
     remoteResourceCacheBytes -= old.bytes;
   }
+}
+
+// Periodic sweep: purge expired entries every TTL/2 to prevent unbounded
+// accumulation of stale entries that are never re-requested.
+if (REMOTE_CACHE_MAX_BYTES > 0 && REMOTE_CACHE_TTL_MS > 0) {
+  const sweepInterval = Math.max(60_000, Math.floor(REMOTE_CACHE_TTL_MS / 2));
+  setInterval(() => {
+    const now = Date.now();
+    for (const [url, entry] of remoteResourceCache) {
+      if (entry.expiresAt <= now) {
+        remoteResourceCacheBytes -= entry.bytes;
+        remoteResourceCache.delete(url);
+      }
+    }
+  }, sweepInterval);
 }
 
 function getBrowser() {
