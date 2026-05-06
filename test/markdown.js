@@ -50,7 +50,7 @@ function check(label, cond, ctx = {}) {
 }
 
 async function buildBoth(emlBuf) {
-  const mail = await simpleParser(emlBuf);
+  const mail = await simpleParser(emlBuf, { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
   const metadata = {
@@ -67,6 +67,13 @@ async function buildBoth(emlBuf) {
   };
   const md = buildMarkdown(mail, body, metadata);
   return { md, metadata, usedCids };
+}
+
+async function buildBody(emlBuf) {
+  const mail = await simpleParser(emlBuf, { skipImageLinks: true });
+  const warnings = [];
+  const { body } = buildHtmlForTest(mail, 'UTC', warnings);
+  return { body, warnings };
 }
 
 // 1. YAML frontmatter + H1 + simple body.
@@ -90,7 +97,7 @@ async function buildBoth(emlBuf) {
 
 // 1b. Markdown injection via subject / message-id / from is neutralized.
 {
-  const mail = await simpleParser(eml('<p>safe body</p>'));
+  const mail = await simpleParser(eml('<p>safe body</p>'), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const malicious = {
     messageId: '<a@b>\n# INJECTED-MID\n',
@@ -179,7 +186,7 @@ async function buildBoth(emlBuf) {
 
 // 6. Attachments section appears when metadata has attachments.
 {
-  const mail = await simpleParser(eml('<p>x</p>'));
+  const mail = await simpleParser(eml('<p>x</p>'), { skipImageLinks: true });
   const warnings = [];
   const { body } = buildHtmlForTest(mail, 'UTC', warnings);
   const metadata = {
@@ -203,7 +210,7 @@ async function buildBoth(emlBuf) {
 
 // 7. Warnings section appears when warnings array is non-empty.
 {
-  const mail = await simpleParser(eml('<p>x</p>'));
+  const mail = await simpleParser(eml('<p>x</p>'), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const metadata = {
     subject: 's', from: '', to: [], cc: [], date: null, timezone: 'UTC',
@@ -229,13 +236,28 @@ MIME-Version: 1.0
 Content-Type: text/plain
 
 `, 'utf8');
-  const mail = await simpleParser(emptyEml);
+  const mail = await simpleParser(emptyEml, { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const md = buildMarkdown(mail, body, {
     subject: mail.subject, from: '', to: [], cc: [], date: null, timezone: 'UTC',
     inlineImagesResolved: 0, attachments: [], warnings: [],
   });
   check('empty body doesn\'t crash', typeof md === 'string' && md.length > 0, { md });
+}
+
+// 9. Outlook Web App loader overlays are stripped so they cannot blank PDFs.
+{
+  const { body } = await buildBody(eml(`
+    <style>
+      #loadingScreen { position: fixed; inset: 0; background-color: #fff; }
+    </style>
+    <div id="loadingScreen"><div id="loadingLogo"><img id="MSLogo"></div></div>
+    <p>Visible message body</p>
+  `));
+  check('OWA loadingScreen node stripped', !/id=["']loadingScreen["']/i.test(body), { body });
+  check('OWA loadingLogo node stripped', !/id=["']loadingLogo["']/i.test(body), { body });
+  check('OWA MSLogo node stripped', !/id=["']MSLogo["']/i.test(body), { body });
+  check('OWA message content preserved', body.includes('Visible message body'), { body });
 }
 
 if (fail) {

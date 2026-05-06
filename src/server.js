@@ -1,6 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { convertEmail, shutdownBrowser } from './convert.js';
+import { convertEmail, shutdownBrowser, sanitizeFilename } from './convert.js';
+import { convertThread } from './thread.js';
 import { parseMultipart } from './multipart.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -15,6 +16,9 @@ const MAX_CONCURRENT_RENDERS = parseInt(process.env.MAX_CONCURRENT_RENDERS || '5
 const MAX_QUEUED_EML_MB = parseInt(process.env.MAX_QUEUED_EML_MB || '500', 10);
 const MAX_QUEUED_EML_BYTES = MAX_QUEUED_EML_MB * 1024 * 1024;
 const MAX_QUEUE_WAIT_MS = parseInt(process.env.MAX_QUEUE_WAIT_MS || '180000', 10);
+const MAX_THREAD_MESSAGES = parseInt(process.env.MAX_THREAD_MESSAGES || '200', 10);
+const MAX_MESSAGE_DECODED_BYTES = parseInt(process.env.MAX_MESSAGE_DECODED_BYTES || '50000000', 10);
+const MAX_TOTAL_THREAD_BYTES = parseInt(process.env.MAX_TOTAL_THREAD_BYTES || '524288000', 10); // 500MB default
 const API_KEY = process.env.API_KEY || '';
 
 // Bounds for client-supplied options (DoS protection)
@@ -26,6 +30,59 @@ const clamp = (v, lo, hi, def) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : def;
 };
+
+const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
+
+function parseCommonOptions(options = {}, defaults = {}) {
+  const {
+    defaultOutputs = ['pdf'],
+    maxHeightDefault = DEFAULT_MAX_HEIGHT_PX,
+    maxHeightMax = HEIGHT_MAX,
+    timeoutDefault = CONVERSION_TIMEOUT_MS,
+    timeoutMax = TIMEOUT_MAX,
+    endpointLabel = 'options',
+  } = defaults;
+
+  let outputs = defaultOutputs;
+  if (options.outputs !== undefined) {
+    if (!Array.isArray(options.outputs)) {
+      throw Object.assign(
+        new Error(`${endpointLabel}.outputs must be an array of strings ("pdf", "markdown")`),
+        { status: 400 }
+      );
+    }
+    if (options.outputs.length === 0) {
+      throw Object.assign(new Error(`${endpointLabel}.outputs cannot be empty`), { status: 400 });
+    }
+    const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
+    for (const o of normalized) {
+      if (!ALLOWED_OUTPUTS.has(o)) {
+        throw Object.assign(
+          new Error(`Invalid output format "${o}". Allowed: pdf, markdown`),
+          { status: 400 }
+        );
+      }
+    }
+    outputs = normalized;
+  }
+
+  const clientWantsRemote = options.loadRemoteImages !== false;
+  const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
+  const remoteDisabledReason = loadRemoteImages
+    ? null
+    : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
+
+  return {
+    timezone: typeof options.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
+    outputs,
+    widthPx: clamp(options.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
+    maxHeightPx: clamp(options.maxHeightPx, HEIGHT_MIN, maxHeightMax, maxHeightDefault),
+    loadRemoteImages,
+    remoteDisabledReason,
+    timeout: clamp(options.timeout, TIMEOUT_MIN, timeoutMax, timeoutDefault),
+    needsRenderSlot: outputs.includes('pdf'),
+  };
+}
 
 // Render-slot semaphore with byte-bounded backlog.
 // We hold the eml buffer in memory while queued, so bound the total queued bytes,
@@ -110,6 +167,13 @@ const server = http.createServer(async (req, res) => {
     return handleConvert(req, res, requestId);
   }
 
+  if (req.method === 'POST' && req.url === '/convert-thread') {
+    if (!checkAuth(req)) {
+      return jsonError(res, 401, 'Unauthorized');
+    }
+    return handleConvertThread(req, res, requestId);
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -143,53 +207,21 @@ async function handleConvert(req, res, requestId) {
       } catch (e) {
         return jsonError(res, 400, 'Invalid base64 payload');
       }
+      if (emlBuf.length > MAX_MESSAGE_DECODED_BYTES) {
+        return jsonError(res, 413, `decoded message size (${emlBuf.length}) exceeds MAX_MESSAGE_DECODED_BYTES (${MAX_MESSAGE_DECODED_BYTES})`);
+      }
     }
 
     if (typeof messageId === 'string') {
       messageId = messageId.replace(/[\x00-\x1f]/g, '').slice(0, 998);
     }
 
-    // Env acts as a ceiling: client cannot ELEVATE remote-image loading above
-    // the operator setting. Track WHY remote was disabled so the warning we
-    // emit later is actionable (env vs client choice).
-    const clientWantsRemote = options?.loadRemoteImages !== false;
-    const loadRemoteImages = LOAD_REMOTE_IMAGES && clientWantsRemote;
-    const remoteDisabledReason = loadRemoteImages
-      ? null
-      : (!LOAD_REMOTE_IMAGES ? 'env' : 'client');
-
-    // outputs: array of formats to produce. Default ['pdf'] for backward
-    // compatibility. Validate here (not just in convertEmail) so we know
-    // upfront whether we need a render slot — markdown-only conversions
-    // skip Chromium and therefore don't need to wait in the render queue.
-    const ALLOWED_OUTPUTS = new Set(['pdf', 'markdown']);
-    let requestedOutputs = ['pdf'];
-    if (options?.outputs !== undefined) {
-      if (!Array.isArray(options.outputs)) {
-        return jsonError(res, 400, 'options.outputs must be an array of strings ("pdf", "markdown")');
-      }
-      if (options.outputs.length === 0) {
-        return jsonError(res, 400, 'options.outputs cannot be empty');
-      }
-      const normalized = [...new Set(options.outputs.map(s => String(s).toLowerCase()))];
-      for (const o of normalized) {
-        if (!ALLOWED_OUTPUTS.has(o)) {
-          return jsonError(res, 400, `Invalid output format "${o}". Allowed: pdf, markdown`);
-        }
-      }
-      requestedOutputs = normalized;
-    }
-    const needsRenderSlot = requestedOutputs.includes('pdf');
-
-    const opts = {
-      widthPx: clamp(options?.widthPx, WIDTH_MIN, WIDTH_MAX, DEFAULT_WIDTH_PX),
-      maxHeightPx: clamp(options?.maxHeightPx, HEIGHT_MIN, HEIGHT_MAX, DEFAULT_MAX_HEIGHT_PX),
-      loadRemoteImages,
-      remoteDisabledReason,
-      timeout: clamp(options?.timeout, TIMEOUT_MIN, TIMEOUT_MAX, CONVERSION_TIMEOUT_MS),
-      timezone: typeof options?.timezone === 'string' ? options.timezone : DEFAULT_TIMEZONE,
-      outputs: requestedOutputs,
-    };
+    // Parse common client options in one place so /convert and /convert-thread
+    // cannot drift when we add outputs, remote-image policy, or render bounds.
+    const { needsRenderSlot, ...opts } = parseCommonOptions(options || {}, {
+      defaultOutputs: ['pdf'],
+      endpointLabel: 'options',
+    });
 
     // Only acquire the render-slot semaphore for conversions that actually
     // need Chromium. Markdown-only is parse + sanitize + turndown — light
@@ -243,6 +275,124 @@ async function handleConvert(req, res, requestId) {
   }
 }
 
+async function handleConvertThread(req, res, requestId) {
+  const started = Date.now();
+  let acquired = false;
+
+  try {
+    const body = await readJsonBody(req, MAX_REQUEST_BYTES);
+
+    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+      return jsonError(res, 400, 'messages array must not be empty');
+    }
+
+    if (body.messages.length > MAX_THREAD_MESSAGES) {
+      return jsonError(res, 413, `Too many messages (${body.messages.length}). Limit: ${MAX_THREAD_MESSAGES}`);
+    }
+
+    // Validate each message has raw payload and track cumulative decoded size
+    let totalDecodedBytes = 0;
+    for (let i = 0; i < body.messages.length; i++) {
+      const msg = body.messages[i];
+      if (!msg.rawBase64Url && !msg.emlBase64) {
+        return jsonError(res, 400, `messages[${i}] must have rawBase64Url or emlBase64`);
+      }
+      const raw = msg.rawBase64Url || msg.emlBase64 || '';
+      const decodedBytesApprox = Math.ceil(String(raw).replace(/\s+/g, '').length * 0.75);
+      if (decodedBytesApprox > MAX_MESSAGE_DECODED_BYTES) {
+        return jsonError(res, 413, `messages[${i}] decoded size (${decodedBytesApprox}) exceeds MAX_MESSAGE_DECODED_BYTES (${MAX_MESSAGE_DECODED_BYTES})`);
+      }
+      totalDecodedBytes += decodedBytesApprox;
+    }
+
+    if (totalDecodedBytes > MAX_TOTAL_THREAD_BYTES) {
+      return jsonError(res, 413, `Total decoded size (${totalDecodedBytes}) exceeds MAX_TOTAL_THREAD_BYTES (${MAX_TOTAL_THREAD_BYTES})`);
+    }
+
+    const options = body.options || {};
+
+    const commonOptions = parseCommonOptions(options, {
+      defaultOutputs: ['pdf', 'markdown'],
+      maxHeightDefault: DEFAULT_MAX_HEIGHT_PX * 2,
+      timeoutDefault: CONVERSION_TIMEOUT_MS * 2,
+      timeoutMax: TIMEOUT_MAX * 2,
+      endpointLabel: 'options',
+    });
+    const requestedOutputs = commonOptions.outputs;
+    const needsRenderSlot = commonOptions.needsRenderSlot;
+
+    // quoteMode validation
+    let quoteMode = 'preserve';
+    if (options.quoteMode !== undefined) {
+      quoteMode = String(options.quoteMode).toLowerCase();
+      if (quoteMode !== 'strip' && quoteMode !== 'preserve') {
+        return jsonError(res, 400, 'options.quoteMode must be "strip" or "preserve"');
+      }
+    }
+
+    const { needsRenderSlot: _needsRenderSlot, ...optsBase } = commonOptions;
+    const opts = {
+      ...optsBase,
+      threadId: body.threadId ? sanitizeFilename(String(body.threadId)) : undefined,
+      quoteMode,
+    };
+
+    // Calculate total payload bytes for queue accounting
+    const totalBytes = body.messages.reduce((sum, m) => {
+      const raw = m.rawBase64Url || m.emlBase64 || '';
+      return sum + Math.ceil(raw.length * 0.75); // approx decoded size
+    }, 0);
+
+    if (needsRenderSlot) {
+      await acquire(totalBytes);
+      acquired = true;
+    }
+
+    const result = await convertThread(body.messages, opts);
+
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': 'attachment; filename="thread-result.zip"',
+    });
+    res.end(result.zipBuffer);
+
+    console.log(JSON.stringify({
+      level: 'info',
+      requestId,
+      endpoint: 'convert-thread',
+      durationMs: Date.now() - started,
+      messageCount: body.messages.length,
+      zipBytes: result.zipBuffer?.length || 0,
+      attachments: result.metadata?.attachments?.length || 0,
+      quoteMode,
+      outputs: requestedOutputs,
+    }));
+  } catch (err) {
+    const status = err.status || 500;
+    const isBackpressure = status === 503 && err.retryAfter;
+    const clientMsg = (status >= 500 && !isBackpressure) ? 'Internal error' : err.message;
+    console.error(JSON.stringify({
+      level: 'error',
+      requestId,
+      endpoint: 'convert-thread',
+      durationMs: Date.now() - started,
+      status,
+      error: err.message,
+    }));
+    if (!res.headersSent) {
+      if (err.retryAfter) {
+        res.setHeader('Retry-After', String(err.retryAfter));
+        res.setHeader('X-Queue-Limit-MB', String(MAX_QUEUED_EML_MB));
+        res.setHeader('X-Queued-Bytes', String(queuedBytes));
+        res.setHeader('X-In-Flight-Renders', String(inFlight));
+      }
+      jsonError(res, status, clientMsg);
+    }
+  } finally {
+    if (acquired) release();
+  }
+}
+
 function decodeBase64Url(raw) {
   if (typeof raw !== 'string') throw new Error('rawBase64Url must be string');
   const normalized = raw.replace(/-/g, '+').replace(/_/g, '/');
@@ -268,7 +418,7 @@ function readJsonBody(req, maxBytes) {
     const safeReject = (e) => {
       if (settled) return;
       settled = true;
-      try { req.destroy(); } catch { /* ignore */ }
+      try { req.destroy(); } catch {}
       reject(e);
     };
     const safeResolve = (v) => {
@@ -307,7 +457,8 @@ function jsonError(res, status, message) {
 }
 
 server.listen(PORT, () => {
-  console.log(`mail-to-pdf listening on :${PORT} (max ${MAX_REQUEST_MB}MB/req, concurrency ${MAX_CONCURRENT_RENDERS}, queue ${MAX_QUEUED_EML_MB}MB/${MAX_QUEUE_WAIT_MS}ms, auth ${API_KEY ? 'on' : 'off'})`);
+  const authWarning = !API_KEY ? ' ⚠️  No API_KEY set — service is unauthenticated' : '';
+  console.log(`mail-to-pdf listening on :${PORT} (max ${MAX_REQUEST_MB}MB/req, concurrency ${MAX_CONCURRENT_RENDERS}, queue ${MAX_QUEUED_EML_MB}MB/${MAX_QUEUE_WAIT_MS}ms, auth ${API_KEY ? 'on' : 'off'})${authWarning}`);
 });
 
 let shuttingDown = false;

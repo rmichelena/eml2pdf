@@ -2,8 +2,43 @@ import { simpleParser } from 'mailparser';
 import { chromium } from 'playwright';
 import archiver from 'archiver';
 import sanitizeHtml from 'sanitize-html';
+import { createHash } from 'crypto';
 import { isPrivateHost } from './netfilter.js';
 import { buildMarkdown } from './markdown.js';
+import { formatTimestampStem } from './textutil.js';
+
+export const EMAIL_RENDER_CSP = [
+  "default-src 'none'",
+  "img-src http: https: data: cid:",
+  "style-src 'unsafe-inline' http: https:",
+  "font-src http: https: data:",
+  "media-src http: https: data:",
+  "script-src 'none'",
+  "frame-src 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+].join('; ');
+
+// Outlook Web App sometimes embeds its full loading screen markup/CSS inside
+// forwarded/saved messages. If preserved, the fixed white overlay can cover
+// the entire Chromium viewport and produce a visually blank PDF. We remove the
+// known loader nodes during sanitization and also hide them in the wrapper CSS
+// as a second line of defense.
+const OWA_LOADER_IDS = new Set(['loadingscreen', 'loadinglogo', 'mslogo']);
+
+export const EMAIL_RENDER_DEFENSIVE_CSS = `
+      #eml2pdf-email-body [id="loadingScreen"],
+      #eml2pdf-email-body [id="loadingLogo"],
+      #eml2pdf-email-body [id="MSLogo"],
+      .eml2pdf-message-body [id="loadingScreen"],
+      .eml2pdf-message-body [id="loadingLogo"],
+      .eml2pdf-message-body [id="MSLogo"]{
+        display:none !important;
+        visibility:hidden !important;
+        opacity:0 !important;
+        pointer-events:none !important;
+      }`;
 
 // Permissive but explicit tag allowlist for email HTML.
 // Excludes by omission: script, iframe, object, embed, frame, frameset, applet,
@@ -98,6 +133,98 @@ const LAUNCH_ARGS = [
   '--disable-sync',
   '--no-first-run',
 ];
+
+const REMOTE_CACHE_MAX_BYTES = Math.max(0, parseInt(process.env.REMOTE_RESOURCE_CACHE_MB || '100', 10)) * 1024 * 1024;
+const REMOTE_CACHE_TTL_MS = Math.max(0, parseInt(process.env.REMOTE_RESOURCE_CACHE_TTL_MS || String(24 * 60 * 60 * 1000), 10));
+const remoteResourceCache = new Map(); // url → { status, headers, body, bytes, expiresAt, lastUsed }
+let remoteResourceCacheBytes = 0;
+
+function cacheableResponse(headers = {}) {
+  const cc = String(headers['cache-control'] || '').toLowerCase();
+  if (cc.includes('no-store') || cc.includes('private')) return false;
+  const ct = String(headers['content-type'] || '').toLowerCase();
+  return /^(image|font)\//.test(ct) || ct.includes('text/css');
+}
+
+function fulfillHeaders(headers = {}, bodyLength = null) {
+  const out = { ...headers };
+  // Playwright's APIResponse.body() is the bytes we will fulfill with. Do not
+  // replay transport/framing/compression headers from the upstream response:
+  // if the body has already been decoded but `content-encoding: gzip/br` is
+  // preserved, Chromium can try to decode it again and intermittently fail to
+  // render cached signature images.
+  for (const k of Object.keys(out)) {
+    const lower = k.toLowerCase();
+    if (
+      lower === 'content-encoding' ||
+      lower === 'content-length' ||
+      lower === 'transfer-encoding' ||
+      lower === 'connection' ||
+      lower === 'keep-alive'
+    ) {
+      delete out[k];
+    }
+  }
+  if (bodyLength != null) out['content-length'] = String(bodyLength);
+  return out;
+}
+
+function getCachedRemote(url) {
+  if (REMOTE_CACHE_MAX_BYTES <= 0) return null;
+  const entry = remoteResourceCache.get(url);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    remoteResourceCache.delete(url);
+    remoteResourceCacheBytes -= entry.bytes;
+    return null;
+  }
+  entry.lastUsed = Date.now();
+  // Move to end of Map iteration order for true LRU eviction
+  remoteResourceCache.delete(url);
+  remoteResourceCache.set(url, entry);
+  return entry;
+}
+
+function putCachedRemote(url, entry) {
+  if (REMOTE_CACHE_MAX_BYTES <= 0 || REMOTE_CACHE_TTL_MS <= 0) return;
+  if (entry.status !== 200) return;
+  if (!cacheableResponse(entry.headers) || entry.body.length > REMOTE_CACHE_MAX_BYTES) return;
+  const prev = remoteResourceCache.get(url);
+  if (prev) remoteResourceCacheBytes -= prev.bytes;
+
+  const cached = {
+    ...entry,
+    bytes: entry.body.length,
+    expiresAt: Date.now() + REMOTE_CACHE_TTL_MS,
+    lastUsed: Date.now(),
+  };
+  remoteResourceCache.set(url, cached);
+  remoteResourceCacheBytes += cached.bytes;
+
+  // FIFO eviction: Map iterates in insertion order, so the first entry is
+  // the oldest. No linear scan needed.
+  while (remoteResourceCacheBytes > REMOTE_CACHE_MAX_BYTES && remoteResourceCache.size > 0) {
+    const firstKey = remoteResourceCache.keys().next().value;
+    const old = remoteResourceCache.get(firstKey);
+    remoteResourceCache.delete(firstKey);
+    remoteResourceCacheBytes -= old.bytes;
+  }
+}
+
+// Periodic sweep: purge expired entries every TTL/2 to prevent unbounded
+// accumulation of stale entries that are never re-requested.
+if (REMOTE_CACHE_MAX_BYTES > 0 && REMOTE_CACHE_TTL_MS > 0) {
+  const sweepInterval = Math.max(60_000, Math.floor(REMOTE_CACHE_TTL_MS / 2));
+  setInterval(() => {
+    const now = Date.now();
+    for (const [url, entry] of remoteResourceCache) {
+      if (entry.expiresAt <= now) {
+        remoteResourceCacheBytes -= entry.bytes;
+        remoteResourceCache.delete(url);
+      }
+    }
+  }, sweepInterval);
+}
 
 function getBrowser() {
   if (_browserPromise) {
@@ -211,9 +338,9 @@ export async function convertEmail(emlBuf, opts = {}) {
 
   const warnings = [];
 
-  const mail = await simpleParser(emlBuf);
+  const mail = await simpleParser(emlBuf, { skipImageLinks: true });
 
-  const { body: bodyRaw, inlineCount, usedCids } =
+  const { body: bodyRaw, inlineCount, usedCids, usedAttachmentIndexes } =
     buildHtml(mail, timezone, warnings);
 
   // Apply the remote-URL policy statically so both PDF and Markdown see the
@@ -222,15 +349,14 @@ export async function convertEmail(emlBuf, opts = {}) {
   // as defense in depth (catches anything our static analysis missed, e.g.
   // URLs inside @font-face rules).
   const filteredBody = await filterRemoteUrls(bodyRaw, { loadRemoteImages, warnings });
+  const attachments = extractAttachments(mail, usedCids, { usedAttachmentIndexes });
 
   // PDF is the only path that touches Chromium — skip entirely when not asked.
   const pdfBuffer = wantPdf
-    ? await renderPdf(wrapForPdf(filteredBody, mail, timezone), {
+    ? await renderPdf(wrapForPdf(filteredBody, mail, timezone, attachments), {
         widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings,
       })
     : null;
-
-  const attachments = extractAttachments(mail, usedCids);
 
   const metadata = {
     messageId: messageId || mail.messageId || undefined,
@@ -245,6 +371,7 @@ export async function convertEmail(emlBuf, opts = {}) {
       filename: a.filename,
       contentType: a.contentType,
       size: a.size,
+      sha256: a.sha256,
       inline: false,
     })),
     outputs: requestedOutputs,
@@ -308,26 +435,27 @@ function normalizeCid(value = '') {
   return cid;
 }
 
-export { buildHtml as buildHtmlForTest, filterRemoteUrls as filterRemoteUrlsForTest };
+export {
+  buildHtml as buildHtmlForTest,
+  filterRemoteUrls as filterRemoteUrlsForTest,
+  EMAIL_ALLOWED_TAGS,
+  EMAIL_ALLOWED_ATTRS,
+  stripPaginationCss,
+  normalizeCid,
+  bufferToDataUrl,
+  attachmentChecksum,
+  attachmentListHtml,
+  formatBaseName,
+  formatDisplayDate,
+  resolveCidImages,
+  extractCidRefs,
+  extractAttachments,
+  escapeHtml,
+  sanitizeFilename,
+};
 
-function buildHtml(mail, timezone = 'UTC', warnings = []) {
+function buildHtml(mail, timezone = 'UTC', warnings = [], options = {}) {
   const attachments = mail.attachments || [];
-
-  // Build a cid → data URL map for all image attachments with a Content-ID,
-  // and a parallel cid → dataUrl record we'll use later to detect which
-  // images actually ended up inline in the rendered HTML.
-  // Casing is inconsistent across clients, so index both canonical and lowercase.
-  const cidMap = new Map();
-  const dataUrlByCid = new Map();
-  for (const att of attachments) {
-    if (att.contentId && att.contentType?.startsWith('image/')) {
-      const cid = normalizeCid(att.contentId);
-      const dataUrl = bufferToDataUrl(att.content, att.contentType);
-      cidMap.set(cid, dataUrl);
-      cidMap.set(cid.toLowerCase(), dataUrl);
-      dataUrlByCid.set(cid, dataUrl);
-    }
-  }
 
   let rawHtml = mail.html || mail.textAsHtml || escapeHtml(mail.text || '');
 
@@ -382,6 +510,10 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
       img: ['http', 'https', 'data', 'cid'],
     },
     parseStyleAttributes: false, // keep style attrs as-is for fidelity
+    exclusiveFilter(frame) {
+      const id = String(frame.attribs?.id || '').toLowerCase();
+      return OWA_LOADER_IDS.has(id);
+    },
     // We intentionally keep <style> in the allowlist — it's essential for
     // email rendering fidelity (Outlook/marketing emails rely heavily on it).
     // Defenses in depth that make this safe here:
@@ -403,51 +535,99 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     (_, open, css, close) => `${open}${stripPaginationCss(css)}${close}`
   );
 
-  // Resolve any cid: → data: that mailparser didn't already inline.
-  // mailparser auto-resolves `<img src="cid:...">` for multipart/related
-  // emails, but only the canonical quoted form — unquoted attributes,
-  // case-mismatched CIDs, `background=cid:...` (legacy Outlook/marketing),
-  // and CSS `url(cid:...)` slip through. Chromium can't load cid: itself
-  // in setContent and our context.route would block it anyway, so anything
-  // not replaced here would fail to render.
+  if (options.resolveCids === false) {
+    return {
+      body: cleanBodyNoPagination,
+      inlineCount: 0,
+      usedCids: new Set(),
+    };
+  }
+
+  return resolveCidImages(cleanBodyNoPagination, mail, warnings);
+}
+
+function buildCidIndex(mail, warnings = []) {
+  const cidMap = new Map();
+  const byCid = new Map();
+
+  for (let index = 0; index < (mail.attachments || []).length; index++) {
+    const att = mail.attachments[index];
+    if (!att.contentId || !att.contentType?.startsWith('image/')) continue;
+    const cid = normalizeCid(att.contentId);
+    const key = cid.toLowerCase();
+    const sha256 = attachmentChecksum(att.content);
+    const dataUrl = bufferToDataUrl(att.content, att.contentType);
+    if (!byCid.has(key)) byCid.set(key, []);
+    byCid.get(key).push({ cid, sha256, dataUrl, index });
+  }
+
+  for (const [key, entries] of byCid) {
+    const distinctHashes = new Set(entries.map(e => e.sha256));
+    if (distinctHashes.size > 1) {
+      warnings.push(
+        `Duplicate Content-ID with different image content: ${entries[0].cid} ` +
+        `(${entries.length} MIME parts; resolving references in MIME order)`
+      );
+    }
+    // Keep all entries as a FIFO queue. Duplicate CIDs are malformed but common
+    // in Outlook/forwarded mail. Resolving references left-to-right against MIME
+    // order is not perfect, but it is better than overwriting or always using
+    // the first image for every occurrence.
+    cidMap.set(key, { entries, cursor: 0 });
+  }
+  return cidMap;
+}
+
+function resolveCidImages(body, mail, warnings = []) {
+  const cidMap = buildCidIndex(mail, warnings);
   const unresolvedCids = new Set();
+  const usedCids = new Set();
+  const usedAttachmentIndexes = new Set();
 
   function resolveCid(rawCid) {
     const cid = normalizeCid(rawCid);
-    const dataUrl = cidMap.get(cid) || cidMap.get(cid.toLowerCase());
-    if (!dataUrl) {
+    const queue = cidMap.get(cid.toLowerCase());
+    if (!queue || !queue.entries.length) {
       unresolvedCids.add(cid);
       return null;
     }
-    return dataUrl;
+    const entry = queue.entries[Math.min(queue.cursor, queue.entries.length - 1)];
+    // Advance only when there are duplicate MIME parts. If a single image is
+    // referenced several times, every occurrence should reuse that one part.
+    if (queue.entries.length > 1) queue.cursor++;
+    usedCids.add(cid);
+    usedCids.add(cid.toLowerCase());
+    usedAttachmentIndexes.add(entry.index);
+    return entry.dataUrl;
   }
 
-  let bodyWithImages = cleanBodyNoPagination;
+  let bodyWithImages = String(body || '');
 
-  // Pass 1: <img src="cid:..."> and <source src="cid:...">
+  // src="cid:..." / background="cid:..." — quoted or unquoted.
   bodyWithImages = bodyWithImages.replace(
-    /\bsrc\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
-    (m, q, rawCid) => {
+    /\b(src|background)\s*=\s*(["']?)\s*cid:([^"'\s>]+)\2/gi,
+    (m, attr, q, rawCid) => {
       const dataUrl = resolveCid(rawCid);
       if (!dataUrl) return m;
       const quote = q || '"';
-      return `src=${quote}${dataUrl}${quote}`;
+      return `${attr}=${quote}${dataUrl}${quote}`;
     }
   );
 
-  // Pass 2: <body background="cid:...">, <table background="cid:...">,
-  //         <td background="cid:..."> — legacy Outlook/marketing pattern.
+  // srcset="cid:... 1x, cid:... 2x". We replace CID URLs inside the
+  // attribute value and keep descriptors intact.
   bodyWithImages = bodyWithImages.replace(
-    /\bbackground\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
-    (m, q, rawCid) => {
-      const dataUrl = resolveCid(rawCid);
-      if (!dataUrl) return m;
-      const quote = q || '"';
-      return `background=${quote}${dataUrl}${quote}`;
+    /\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi,
+    (m, q, value) => {
+      const replaced = value.replace(/(^|[,\s])cid:([^,\s]+)/gi, (mm, prefix, rawCid) => {
+        const dataUrl = resolveCid(rawCid);
+        return dataUrl ? `${prefix}${dataUrl}` : mm;
+      });
+      return `srcset=${q}${replaced}${q}`;
     }
   );
 
-  // Pass 3: CSS url(cid:...) inside style="..." attributes or <style> blocks.
+  // CSS url(cid:...) inside style="..." attributes or <style> blocks.
   bodyWithImages = bodyWithImages.replace(
     /url\s*\(\s*(["']?)\s*cid:([^"'\s)]+)\1\s*\)/gi,
     (m, q, rawCid) => {
@@ -458,25 +638,6 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     }
   );
 
-  // Determine which image attachments actually made it inline by checking the
-  // final HTML for their data: URL. This is robust regardless of which path
-  // performed the substitution (mailparser pre-render, our regex above, or
-  // even an exotic third route). Comparing the full data URL is fine
-  // performance-wise: one substring scan per image attachment per request.
-  const usedCids = new Set();
-  for (const [cid, dataUrl] of dataUrlByCid) {
-    if (bodyWithImages.includes(dataUrl)) {
-      usedCids.add(cid);
-      usedCids.add(cid.toLowerCase());
-    }
-  }
-  const inlineCount = usedCids.size > 0
-    ? new Set([...usedCids].map(c => c.toLowerCase())).size
-    : 0;
-
-  // Surface unresolved CIDs individually so metadata.json is diagnostic.
-  // Cap the listing to keep the array bounded if a malformed email references
-  // dozens of broken cids.
   const MAX_UNRESOLVED_LISTED = 10;
   const unresolvedList = [...unresolvedCids];
   for (const cid of unresolvedList.slice(0, MAX_UNRESOLVED_LISTED)) {
@@ -486,11 +647,26 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
     warnings.push(`…and ${unresolvedList.length - MAX_UNRESOLVED_LISTED} more unresolved CID(s)`);
   }
 
-  return {
-    body: bodyWithImages,
-    inlineCount,
-    usedCids,
-  };
+  const inlineCount = usedAttachmentIndexes.size || new Set([...usedCids].map(c => c.toLowerCase())).size;
+  return { body: bodyWithImages, inlineCount, usedCids, usedAttachmentIndexes };
+}
+
+function extractCidRefs(body) {
+  const refs = new Set();
+  const s = String(body || '');
+  const patterns = [
+    /\b(?:src|background)\s*=\s*(["']?)\s*cid:([^"'\s>]+)\1/gi,
+    /url\s*\(\s*(["']?)\s*cid:([^"'\s)]+)\1\s*\)/gi,
+    /\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi,
+  ];
+  for (const m of s.matchAll(patterns[0])) refs.add(normalizeCid(m[2]).toLowerCase());
+  for (const m of s.matchAll(patterns[1])) refs.add(normalizeCid(m[2]).toLowerCase());
+  for (const m of s.matchAll(patterns[2])) {
+    for (const cm of m[2].matchAll(/(^|[,\s])cid:([^,\s]+)/gi)) {
+      refs.add(normalizeCid(cm[2]).toLowerCase());
+    }
+  }
+  return refs;
 }
 
 /**
@@ -499,8 +675,9 @@ function buildHtml(mail, timezone = 'UTC', warnings = []) {
  * filtering to the body in between, and reuse the same filtered body for
  * both PDF and Markdown.
  */
-function wrapForPdf(body, mail, timezone) {
+function wrapForPdf(body, mail, timezone, attachments = []) {
   const ccLine = mail.cc?.text ? `<div><strong>CC:</strong> ${esc(mail.cc.text)}</div>` : '';
+  const attachmentHtml = attachmentListHtml(attachments);
   const headerHtml = `
     <div style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #ccc;font-family:Arial,sans-serif;font-size:11pt;line-height:1.5">
       <div><strong>From:</strong> ${esc(mail.from?.text || 'Unknown')}</div>
@@ -510,23 +687,8 @@ function wrapForPdf(body, mail, timezone) {
       ${mail.date ? `<div><strong>Date:</strong> ${esc(formatDisplayDate(mail.date, timezone))}</div>` : ''}
     </div>`;
 
-  // Permissive CSP: allow images/styles/fonts from network for fidelity,
-  // but block scripts, frames, objects, forms.
-  const csp = [
-    "default-src 'none'",
-    "img-src http: https: data: cid:",
-    "style-src 'unsafe-inline' http: https:",
-    "font-src http: https: data:",
-    "media-src http: https: data:",
-    "script-src 'none'",
-    "frame-src 'none'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'none'",
-  ].join('; ');
-
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
-      <meta http-equiv="Content-Security-Policy" content="${csp}">
+      <meta http-equiv="Content-Security-Policy" content="${EMAIL_RENDER_CSP}">
       <style>
       @page { size: auto; margin: 0 }
       html,body{margin:0;padding:0;width:100%}
@@ -542,7 +704,49 @@ function wrapForPdf(body, mail, timezone) {
         page-break-before:auto !important;
         break-before:auto !important;
       }
-    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${body}</div></body></html>`;
+${EMAIL_RENDER_DEFENSIVE_CSS}
+    </style></head><body>${headerHtml}<div id="eml2pdf-email-body">${body}</div>${attachmentHtml}</body></html>`;
+}
+
+function attachmentChecksum(content) {
+  return createHash('sha256').update(content || Buffer.alloc(0)).digest('hex');
+}
+
+function attachmentIcon(contentType = '', filename = '') {
+  const ct = String(contentType).toLowerCase();
+  const name = String(filename).toLowerCase();
+  if (ct.includes('pdf') || name.endsWith('.pdf')) return '📄';
+  if (ct.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|tiff?)$/.test(name)) return '🖼️';
+  if (ct.includes('spreadsheet') || /\.(xlsx?|csv|ods)$/.test(name)) return '📊';
+  if (ct.includes('word') || /\.(docx?|odt|rtf)$/.test(name)) return '📝';
+  if (ct.includes('presentation') || /\.(pptx?|odp)$/.test(name)) return '📽️';
+  if (ct.includes('zip') || /\.(zip|rar|7z|tar|gz)$/.test(name)) return '🗜️';
+  return '📎';
+}
+
+function attachmentListHtml(attachments = [], useMappedName = false) {
+  if (!attachments.length) return '';
+  const rows = attachments.map(att => {
+    const displayName = (useMappedName && att._finalFilename) ? att._finalFilename : (att.filename || 'attachment');
+    return `
+    <li style="margin:4px 0;">
+      <span style="font-size:14px;margin-right:6px;">${attachmentIcon(att.contentType, displayName)}</span>
+      <strong>${esc(displayName)}</strong>
+      <span style="color:#666;"> — ${esc(att.contentType || 'application/octet-stream')}${typeof att.size === 'number' ? ` · ${esc(formatBytesLocal(att.size))}` : ''}</span>
+    </li>`;
+  }).join('');
+  return `
+    <div style="margin-top:16px;padding-top:10px;border-top:1px solid #ddd;font-family:Arial,sans-serif;font-size:10.5pt;line-height:1.35;break-inside:avoid;page-break-inside:avoid;">
+      <div style="font-weight:bold;margin-bottom:6px;">Adjuntos (${attachments.length})</div>
+      <ul style="margin:0;padding-left:20px;">${rows}</ul>
+    </div>`;
+}
+
+function formatBytesLocal(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**
@@ -695,7 +899,7 @@ async function filterRemoteUrls(body, { loadRemoteImages, warnings }) {
   return out;
 }
 
-async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings }) {
+export async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteDisabledReason, timeout, warnings }) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     javaScriptEnabled: false, // emails don't need JS — kills a whole class of risk
@@ -738,7 +942,24 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteD
       return route.abort('blockedbyclient');
     }
 
-    return route.continue();
+    const cached = getCachedRemote(url);
+    if (cached) {
+      return route.fulfill({
+        status: cached.status,
+        headers: fulfillHeaders(cached.headers, cached.body.length),
+        body: cached.body,
+      });
+    }
+
+    try {
+      const response = await route.fetch();
+      const headers = response.headers();
+      const body = await response.body();
+      putCachedRemote(url, { status: response.status(), headers, body });
+      return route.fulfill({ status: response.status(), headers: fulfillHeaders(headers, body.length), body });
+    } catch {
+      return route.continue();
+    }
   });
 
   const page = await context.newPage();
@@ -817,11 +1038,14 @@ async function renderPdf(html, { widthPx, maxHeightPx, loadRemoteImages, remoteD
   }
 }
 
-function extractAttachments(mail, usedCids = new Set()) {
+function extractAttachments(mail, usedCids = new Set(), options = {}) {
   const attachments = [];
   const seenNames = new Map(); // base name → count
+  const removedCids = options.removedCids || new Set();
+  const usedAttachmentIndexes = options.usedAttachmentIndexes || null;
 
-  for (const att of mail.attachments || []) {
+  for (let index = 0; index < (mail.attachments || []).length; index++) {
+    const att = mail.attachments[index];
     if (!att.filename && !att.contentType) continue;
 
     // usedCids is the authoritative signal: it lists the CIDs whose data: URL
@@ -830,8 +1054,11 @@ function extractAttachments(mail, usedCids = new Set()) {
     // every multipart/related part, including ones whose cid: it couldn't
     // actually substitute, and including ones not referenced anywhere.
     const cid = att.contentId ? normalizeCid(att.contentId) : null;
-    const isInline = cid && (usedCids.has(cid) || usedCids.has(cid.toLowerCase()));
-    if (isInline) continue;
+    const isInline = usedAttachmentIndexes
+      ? usedAttachmentIndexes.has(index)
+      : cid && (usedCids.has(cid) || usedCids.has(cid.toLowerCase()));
+    const wasRemovedWithQuote = cid && removedCids.has(cid.toLowerCase());
+    if (isInline || wasRemovedWithQuote) continue;
 
     let name = sanitizeFilename(att.filename || `attachment-${attachments.length}`);
     // Disambiguate duplicates so ZIP entries don't overwrite
@@ -849,6 +1076,7 @@ function extractAttachments(mail, usedCids = new Set()) {
       contentType: att.contentType || 'application/octet-stream',
       content: att.content,
       size: att.size || att.content?.length || 0,
+      sha256: attachmentChecksum(att.content),
     });
   }
   return attachments;
@@ -881,23 +1109,7 @@ async function createZip({ baseName, pdfBuffer, markdownText, metadata, attachme
 // Date-prefixed filename stem, e.g. "2025-01-15 10-30 email" — extension
 // (`.pdf`/`.md`/`.json`) is appended by the ZIP writer.
 function formatBaseName(date, timezone) {
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, '0');
-  let yyyy, mm, dd, hh, min;
-  try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false,
-    }).formatToParts(d);
-    const get = (type) => parts.find(p => p.type === type)?.value || '00';
-    yyyy = get('year'); mm = get('month'); dd = get('day');
-    hh = get('hour'); min = get('minute');
-  } catch {
-    yyyy = d.getUTCFullYear(); mm = pad(d.getUTCMonth() + 1); dd = pad(d.getUTCDate());
-    hh = pad(d.getUTCHours()); min = pad(d.getUTCMinutes());
-  }
-  return `${yyyy}-${mm}-${dd} ${hh}-${min} email`;
+  return formatTimestampStem(date, timezone, 'email');
 }
 
 function formatDisplayDate(date, timezone) {
@@ -916,7 +1128,8 @@ function formatDisplayDate(date, timezone) {
 }
 
 function bufferToDataUrl(buf, mime) {
-  return `data:${mime};base64,${Buffer.from(buf).toString('base64')}`;
+  const cleanMime = String(mime || 'application/octet-stream').split(';')[0].trim() || 'application/octet-stream';
+  return `data:${cleanMime};base64,${Buffer.from(buf).toString('base64')}`;
 }
 
 function sanitizeFilename(name) {

@@ -9,7 +9,7 @@
 // Run: node test/cid.js
 
 import { simpleParser } from 'mailparser';
-import { buildHtmlForTest } from '../src/convert.js';
+import { buildHtmlForTest, extractAttachments } from '../src/convert.js';
 
 const SIG_BYTES = Buffer.from('aGVsbG8gd29ybGQ=', 'base64'); // arbitrary blob
 const SIG_B64 = SIG_BYTES.toString('base64');
@@ -63,7 +63,7 @@ const FIXTURES = [
 ];
 
 for (const fx of FIXTURES) {
-  const mail = await simpleParser(makeEml(fx.html));
+  const mail = await simpleParser(makeEml(fx.html), { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
 
@@ -108,7 +108,7 @@ ${SIG_B64}
 
 --B--
 `, 'utf8');
-  const mail = await simpleParser(eml);
+  const mail = await simpleParser(eml, { skipImageLinks: true });
   const warnings = [];
   const { inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
   check('two CIDs, both referenced', inlineCount === 2 && usedCids.has('one@x') && usedCids.has('two@x') && warnings.length === 0, { inlineCount, usedCids: [...usedCids], warnings });
@@ -118,7 +118,7 @@ ${SIG_B64}
 // Should: inlineCount=0, usedCids empty, no warning, AND extractAttachments
 // (tested implicitly: usedCids empty means it WILL be emitted as attachment).
 {
-  const mail = await simpleParser(makeEml('<p>no image here</p>'));
+  const mail = await simpleParser(makeEml('<p>no image here</p>'), { skipImageLinks: true });
   const warnings = [];
   const { inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
   check('unreferenced CID stays out of usedCids',
@@ -128,7 +128,7 @@ ${SIG_B64}
 
 // HTML references a CID that doesn't exist in attachments → per-cid warning + 0 inline.
 {
-  const mail = await simpleParser(makeEml('<img src="cid:does-not-exist@example.com">'));
+  const mail = await simpleParser(makeEml('<img src="cid:does-not-exist@example.com">'), { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
   const cidStillThere = /cid:does-not-exist/.test(body);
@@ -140,7 +140,7 @@ ${SIG_B64}
 
 // background="cid:..." (legacy Outlook/marketing hero pattern).
 {
-  const mail = await simpleParser(makeEml('<table background="cid:sig123@example.com"><tr><td>x</td></tr></table>'));
+  const mail = await simpleParser(makeEml('<table background="cid:sig123@example.com"><tr><td>x</td></tr></table>'), { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
   const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
@@ -152,7 +152,7 @@ ${SIG_B64}
 
 // CSS url(cid:...) inside style attribute.
 {
-  const mail = await simpleParser(makeEml('<div style="background-image:url(cid:sig123@example.com)">x</div>'));
+  const mail = await simpleParser(makeEml('<div style="background-image:url(cid:sig123@example.com)">x</div>'), { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
   const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
@@ -164,13 +164,120 @@ ${SIG_B64}
 
 // CSS url('cid:...') with single quotes inside style.
 {
-  const mail = await simpleParser(makeEml(`<div style="background:url('cid:sig123@example.com')">x</div>`));
+  const mail = await simpleParser(makeEml(`<div style="background:url('cid:sig123@example.com')">x</div>`), { skipImageLinks: true });
   const warnings = [];
   const { body, inlineCount } = buildHtmlForTest(mail, 'UTC', warnings);
   const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
   check(`CSS url('cid:...') with single quotes resolved`,
     hasDataUrl && inlineCount === 1 && warnings.length === 0,
     { inlineCount, warnings });
+}
+
+// srcset="cid:..." references are resolved and counted.
+{
+  const mail = await simpleParser(makeEml(`<img srcset="cid:sig123@example.com 1x" alt="sig">`), { skipImageLinks: true });
+  const warnings = [];
+  const { body, inlineCount, usedCids } = buildHtmlForTest(mail, 'UTC', warnings);
+  const hasDataUrl = body.includes(`data:image/jpeg;base64,${SIG_B64}`);
+  const cidGone = !/srcset=["'][^"']*cid:/i.test(body);
+  check('srcset cid: resolved',
+    hasDataUrl && cidGone && inlineCount === 1 && usedCids.has('sig123@example.com') && warnings.length === 0,
+    { inlineCount, usedCids: [...usedCids], warnings, body: body.slice(0, 300) });
+}
+
+// Identical image bytes under different CIDs: only the referenced CID is
+// inline. The unreferenced twin must still be emitted as an attachment; using
+// dataUrl presence as the usage signal would incorrectly suppress both.
+{
+  const eml = Buffer.from(
+`From: a@x.com
+Subject: same bytes
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="B"
+
+--B
+Content-Type: text/html
+
+<img src="cid:one@x">
+
+--B
+Content-Type: image/png
+Content-ID: <one@x>
+Content-Transfer-Encoding: base64
+Content-Disposition: inline; filename="one.png"
+
+${SIG_B64}
+
+--B
+Content-Type: image/png
+Content-ID: <two@x>
+Content-Transfer-Encoding: base64
+Content-Disposition: inline; filename="two.png"
+
+${SIG_B64}
+
+--B--
+`, 'utf8');
+  const mail = await simpleParser(eml, { skipImageLinks: true });
+  const warnings = [];
+  const { inlineCount, usedCids, usedAttachmentIndexes } = buildHtmlForTest(mail, 'UTC', warnings);
+  const attachments = extractAttachments(mail, usedCids, { usedAttachmentIndexes });
+  check('same bytes/different CIDs: only referenced CID suppresses attachment',
+    inlineCount === 1 && usedCids.has('one@x') && !usedCids.has('two@x') &&
+      attachments.length === 1 && attachments[0].filename === 'two.png',
+    { inlineCount, usedCids: [...usedCids], usedAttachmentIndexes: [...usedAttachmentIndexes], attachments: attachments.map(a => a.filename), warnings });
+}
+
+// Same Content-ID with different bytes: references consume MIME parts FIFO.
+{
+  const OTHER_B64 = Buffer.from('different image bytes').toString('base64');
+  const eml = Buffer.from(
+`From: a@x.com
+Subject: duplicate cid
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="B"
+
+--B
+Content-Type: text/html
+
+<img src="cid:dup@x"><img src="cid:dup@x">
+
+--B
+Content-Type: image/png
+Content-ID: <dup@x>
+Content-Transfer-Encoding: base64
+
+${SIG_B64}
+
+--B
+Content-Type: image/png
+Content-ID: <dup@x>
+Content-Transfer-Encoding: base64
+
+${OTHER_B64}
+
+--B--
+`, 'utf8');
+  const mail = await simpleParser(eml, { skipImageLinks: true });
+  const warnings = [];
+  const { body, inlineCount, usedCids, usedAttachmentIndexes } = buildHtmlForTest(mail, 'UTC', warnings);
+  const dupWarning = warnings.some(w => /Duplicate Content-ID with different image content: dup@x/.test(w));
+  const firstUsed = body.includes(`data:image/png;base64,${SIG_B64}`);
+  const secondUsed = body.includes(`data:image/png;base64,${OTHER_B64}`);
+  const attachments = extractAttachments(mail, usedCids, { usedAttachmentIndexes });
+  check('duplicate Content-ID with different hashes resolves FIFO and warns',
+    inlineCount === 2 && usedCids.has('dup@x') && dupWarning && firstUsed && secondUsed && attachments.length === 0,
+    { inlineCount, usedCids: [...usedCids], usedAttachmentIndexes: [...usedAttachmentIndexes], warnings, firstUsed, secondUsed, attachments: attachments.map(a => a.filename), body });
+}
+
+// MIME parameters are stripped from data: URL media type.
+{
+  const mail = await simpleParser(makeEml('<img src="cid:sig123@example.com">'), { skipImageLinks: true });
+  mail.attachments[0].contentType = 'image/png; name="signature.png"';
+  const { body } = buildHtmlForTest(mail, 'UTC', []);
+  check('data URL MIME type is parameter-free',
+    body.includes('data:image/png;base64,') && !body.includes('data:image/png; name='),
+    { body: body.slice(0, 300) });
 }
 
 // =====================================================================
@@ -225,7 +332,7 @@ const PAGINATION_FIXTURES = [
 ];
 
 for (const fx of PAGINATION_FIXTURES) {
-  const mail = await simpleParser(makePlainHtmlEml(fx.html));
+  const mail = await simpleParser(makePlainHtmlEml(fx.html), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
 
   const noPageBreak = !/\bpage-break-(?:before|after|inside)\s*:/i.test(body);
@@ -246,7 +353,7 @@ for (const fx of PAGINATION_FIXTURES) {
 {
   const mail = await simpleParser(makePlainHtmlEml(
     `<p style="color:red; page-break-before:always; font-size:14px; break-after: page">hi</p>`
-  ));
+  ), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   const colorKept = /color\s*:\s*red/.test(body);
   const fontSizeKept = /font-size\s*:\s*14px/.test(body);
@@ -263,7 +370,7 @@ for (const fx of PAGINATION_FIXTURES) {
 {
   const mail = await simpleParser(makePlainHtmlEml(
     `<html><head><title>SPAM</title><meta http-equiv="refresh" content="0;url=https://evil"><style>.foo{color:red}</style></head><body><p>content</p></body></html>`
-  ));
+  ), { skipImageLinks: true });
   const { body } = buildHtmlForTest(mail, 'UTC', []);
   // Email's <title> text must not leak into rendered body.
   const noTitleLeak = !/SPAM/.test(body);
